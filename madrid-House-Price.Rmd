@@ -1,0 +1,2498 @@
+---
+title: "Madrid House Price"
+author: "Sergio Fernández, Miguel Ocón, Enrique Roa"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    theme: flatly
+    number_sections: yes
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	include = TRUE,
+	warning = FALSE,
+	message = FALSE,
+	fig.align = "center",
+	out.width = "90%"
+)
+```
+
+![](Gran Vía Madrid.jpg)
+
+# Introducción y definición de objetivos
+
+El análisis de datos en el mercado inmobiliario es algo muy común y que lleva muchísimos años  desarrollándose. Con el objetivo de predecir que aspectos influyen principalmente en el precio de las casas en Madrid, hemos seleccionado un dataset  ([kaggle - Madrid House Price](https://www.kaggle.com/datasets/kevsde/madrid-house-price)) con viviendas en venta de la capital española.
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(kableExtra)
+library(ggplot2)
+library(GGally)
+library(gridExtra)
+library(cowplot)
+library(ggcorrplot)
+library(plotly)
+library(gmodels)
+library(caret)
+library(ggfortify)
+library(scales)
+library(class)
+library(distances)
+library(visreg)
+library(rpart)
+library(rpart.plot)
+library(rattle)
+library(randomForest)
+library(e1071)
+library(pROC)
+library(cluster)
+library(tidyverse)
+library(stringr)
+library(Metrics)
+library(factoextra)
+library(NbClust)
+library(neuralnet)
+library(nnet)
+library(reticulate)
+library(xgboost)
+library(SHAPforxgboost)
+library(lime)
+
+# Librerías para SERIES TEMPORALES
+library(xts)
+library(forecast)
+library(tsibble)
+library(tidyquant)
+library(feasts)
+library(fable)
+library(stats)
+library(zoo)
+library(DT)
+library(signal)
+library(entropy)
+```
+
+```{r}
+paste(R.Version()$version.string)
+```
+# Análisis exploratorio inicial
+
+## Lectura y preparación de los datos
+
+En esta primera etapa cargamos el dataset descargado y hacemos una observación superficial de las variables recogidas y sus características. Se representan también las 10 filas iniciales.
+
+```{r}
+mhp <- read_csv("house_price_madrid_14_08_2022.csv")
+```
+
+```{r}
+head(mhp, 10) %>%
+  kbl() %>%
+  kable_material(c("striped", "hover")) %>%
+  scroll_box(width = "100%", height = "350px")
+```
+
+```{r}
+summary(mhp)
+```
+
+```{r}
+str(mhp) 
+```
+
+El dataset contiene **15.975 observaciones** (correspondientes a una vivienda cada una) y **9 variables** (de las cuales son **6 cualitativas** y **3 cuantitativas**).
+
+A continuación, la descripción de cada una de las variables:
+
+  - **price**: precio
+  
+  - **house_type**: tipo de vivienda (casa, chalet, piso...)
+  
+  - **house_type_2**: si es exterior o interior
+  
+  - **rooms**: número de habitaciones
+  
+  - **m2**: metros cuadrados
+  
+  - **elevator**: si tiene ascensor
+  
+  - **garage**: si incluye garaje
+  
+  - **neighborhood**: barrio de Madrid
+  
+  - **district**: distrito de Madrid
+
+Tras esta primera observación se harán algunas modificaciones en el dataset para transformar a variables de tipo categórico las que correspondan, así como transformar a binarias (1/0) aquellas con sólo dos valores posibles.
+
+```{r}
+# Preparación de los datos. Convertimos a factores las variables que son categóricas y a 1-0 las binarias.
+
+mhp <- mhp %>% rename(exterior = house_type_2)
+mhp$exterior = ifelse(mhp$exterior == "exterior", 1, 0)
+mhp$exterior = factor(mhp$exterior, levels = c(1,0))
+
+mhp$elevator = ifelse(mhp$elevator == "TRUE", 1, 0)
+mhp$elevator = factor(mhp$elevator, levels = c(1,0))
+
+mhp$garage = ifelse(mhp$garage == "TRUE", 1, 0)
+mhp$garage = factor(mhp$garage, levels = c(1,0))
+
+mhp$house_type <- as.factor(mhp$house_type)
+mhp$exterior <- as.factor(mhp$exterior)
+mhp$elevator <- as.factor(mhp$elevator)
+mhp$garage <- as.factor(mhp$garage)
+mhp$neighborhood <- as.factor(mhp$neighborhood)
+mhp$district <- as.factor(mhp$district)
+```
+
+## Tratamiento de datos faltantes
+
+Convertimos en NA aquellas observaciones que claramente contienen algún error:
+
+  - La casa de 41 habitaciones (probablemente fueran 4 y esté mal imputado)
+  
+  - Las que tienen menos de 3 m2 (probablemente mal imputados al usar el punto para separar los miles)
+  
+  - La casa con un precio de 725 (claramente equivocado).
+
+```{r}
+mhp$rooms[mhp$rooms > 40] <- NA
+mhp$m2[mhp$m2 < 3] <- NA
+mhp$price[mhp$price < 1000] <- NA
+```
+
+Por otro lado, la variable **house_type_2** tiene 469 filas sin datos. Junto a los NA añadidos en el paso anterior son el 3.2% del total, por lo que optaremos por eliminar estas filas del dataset.
+
+```{r}
+sum(is.na(mhp))/nrow(mhp)
+mhp <- na.omit(mhp)
+```
+
+## División del dataset
+
+Para finalizar la preparación de los datos, dividiremos nuestro dataset en tres partes, una de entrenamiento (train), con el que trabajaremos durante todo el análisis, otra de prueba (test) que nos servirá para comprobar la eficacia de los diferentes modelos predictivos que se apliquen, y finalmente uno de validación (validation), que se mantendrá sin usar hasta el último día del proyecto y con el cual validaremos el modelo final.
+
+```{r}
+set.seed(108)
+numero_total = nrow(mhp)
+# Porcentajes de train, test y validation
+w_train = .5
+w_test = .25
+w_validation = 1 - (w_train + w_test)
+
+# Todos los índices
+indices = seq(1:numero_total) 
+
+# Muestreo
+indices_train = sample(1:numero_total, numero_total * w_train)
+indices_test = sample(indices[-indices_train], numero_total * w_test)
+indices_validation = indices[-c(indices_train,indices_test)]
+
+# Agrupamos
+
+mhp_train = mhp[indices_train,]
+mhp_test = mhp[indices_test,]
+mhp_validation = mhp[indices_validation,]
+```
+
+# Análisis univariante
+
+## Análisis de variables cualitativas
+
+Una vez preparado el dataset comenzamos con el análisis de las variables cualitativas, que son las siguientes:
+
+**Tipo de vivienda**
+
+```{r}
+merge(setNames(as.data.frame(table(mhp_train$house_type)), c("house_type", "count")),
+      setNames(as.data.frame(round(prop.table(table(mhp_train$house_type))*100, 2)), c("house_type", "prop (%)"))
+) %>%
+  arrange(desc(count)) %>%
+  kbl() %>%
+  kable_material(c("striped", "hover")) %>%
+  scroll_box(width = "100%", height = "350px")
+```
+
+```{r}
+ggplot(mhp_train, aes(house_type)) +
+  geom_bar(fill = "#0BB363") +
+  coord_flip() +
+  labs(x = "Tipo de vivienda", y = "Número de viviendas", title = "Viviendas por tipo") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Como era de esperar, las viviendas más habituales son pisos en plantas no demasiado altas (bajos, primeros, segundos...). El número de casas y chalets también es pequeño en proporción.
+
+**Orientación exterior**
+
+```{r}
+merge(setNames(as.data.frame(table(mhp_train$exterior)), c("exterior", "count")),
+      setNames(as.data.frame(round(prop.table(table(mhp_train$exterior))*100, 2)), c("exterior", "prop (%)"))
+) %>%
+  kbl() %>%
+  kable_material(c("striped", "hover"))
+```
+
+```{r}
+ggplot(mhp_train, aes(exterior)) +
+  geom_bar(fill = "#0BB363") +
+  labs(x = "Exterior", y = "Número de vivienda de viviendas", title = "Viviendas exteriores") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Son una inmensa mayoría los pisos que dan a exterior.
+
+**Ascensor**
+
+```{r}
+merge(setNames(as.data.frame(table(mhp_train$elevator)), c("elevator", "count")),
+      setNames(as.data.frame(round(prop.table(table(mhp_train$elevator))*100, 2)), c("elevator", "prop (%)"))
+) %>%
+  kbl() %>%
+  kable_material(c("striped", "hover"))
+```
+
+```{r}
+ggplot(mhp_train, aes(elevator)) +
+  geom_bar(fill = "#0BB363") +
+  labs(x = "Ascensor", y = "Número de viviendas", title = "Viviendas con ascensor") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+También es más frecuente que tengan ascensor, aunque casi el 30% no lo tienen.
+
+**Garaje**
+
+```{r}
+merge(setNames(as.data.frame(table(mhp_train$garage)), c("garage", "count")),
+      setNames(as.data.frame(round(prop.table(table(mhp_train$garage))*100, 2)), c("garage", "prop (%)"))
+) %>%
+  kbl() %>%
+  kable_material(c("striped", "hover"))
+```
+
+```{r}
+ggplot(mhp_train, aes(garage)) +
+  geom_bar(fill = "#0BB363") +
+  labs(x = "Garaje", y = "Número de viviendas", title = "Viviendas con garaje") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Parece normal que la mayoría de pisos no tuvieran garaje incluido.
+
+**Barrio**
+
+Esta variable no será muy útil para el análisis, ya que en muchos casos son descripciones de la vivienda hechas por el usuario, por lo que habría que hacer un tratamiento previo para poder agruparlas. Algo innecesario ya que ese mismo efecto se consigue con el siguiente campo: distritos.
+
+```{r}
+merge(setNames(as.data.frame(table(mhp_train$neighborhood)), c("neighborhood", "count")),
+      setNames(as.data.frame(round(prop.table(table(mhp_train$neighborhood))*100, 2)), c("neighborhood", "prop (%)"))
+) %>%
+  kbl() %>%
+  kable_material(c("striped", "hover")) %>%
+  scroll_box(width = "100%", height = "350px")
+```
+
+**Distrito**
+
+En este caso los datos si están correctamente recogidos, repartiendo las casas entre los 21 distritos de Madrid.Casi todos con una representación considerable, en lo que destaca el barrio de Salamanca, con casi el doble de viviendas que el segundo que más tiene, Chamberí.
+
+```{r}
+merge(setNames(as.data.frame(table(mhp_train$district)), c("district", "count")),
+      setNames(as.data.frame(round(prop.table(table(mhp_train$district))*100, 2)), c("district", "prop (%)"))
+) %>%
+  arrange(desc(count)) %>%
+  kbl() %>%
+  kable_material(c("striped", "hover")) %>%
+  scroll_box(width = "100%", height = "350px")
+```
+
+```{r}
+ggplot(mhp_train, aes(district)) +
+  geom_bar(fill = "#0BB363") +
+  labs(x = "Distrito", y = "Número de viviendas", title = "Viviendas por distrito") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+## Análisis de variables cuantitativas
+
+**Precio**
+
+```{r}
+data.frame(summarise(mhp_train,
+                     min = min(price),
+                     max = max(price),
+                     median = median(price),
+                     mean = mean(price),
+                     sd = sd(price))) %>%
+  kbl() %>%
+  kable_material(c("striped", "hover"))
+```
+
+```{r}
+ggplot(mhp_train, aes(y = price)) +
+  geom_boxplot(fill = "#0BB363") +
+  labs(y = "Precio", title = "Boxplot de precios") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r}
+ggplot(mhp_train, aes(price)) +
+  geom_histogram(aes(y = ..count..), bins = 50, position = "dodge", fill = "#0BB363") +
+  labs(x = "Precio", y = "Número de viviendas", title = "Viviendas por Precio") +
+  scale_x_continuous(breaks = pretty(mhp_train$price, n = 10), labels = comma_format()) +
+  scale_y_continuous(labels = function(x) sprintf("%.0f", x)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 30))
+```
+
+**Habitaciones**
+
+```{r}
+data.frame(summarise(mhp_train,
+                     min = min(rooms),
+                     max = max(rooms),
+                     median = median(rooms),
+                     mean = mean(rooms),
+                     sd = sd(rooms))) %>%
+  kbl() %>%
+  kable_material(c("striped", "hover"))
+```
+
+```{r}
+ggplot(mhp_train, aes(y = rooms)) +
+  geom_boxplot(fill = "#0BB363") +
+  labs(y = "Habitaciones", title = "Boxplot de habitaciones") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r}
+ggplot(mhp_train, aes(rooms)) +
+  geom_histogram(aes(), bins = 16, position = "dodge", fill = "#0BB363") +
+  geom_density(alpha=.2, fill = "red") +
+  labs(x = "Habitaciones", y = "Número de viviendas", title = "Viviendas por número de habitaciones") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+**m²**
+
+```{r}
+data.frame(summarise(mhp_train,
+                     min = min(m2),
+                     max = max(m2),
+                     median = median(m2),
+                     mean = mean(m2),
+                     sd = sd(m2))) %>%
+  kbl() %>%
+  kable_material(c("striped", "hover"))
+```
+
+```{r}
+ggplot(mhp_train, aes(y = m2)) +
+  geom_boxplot(fill = "#0BB363") +
+  labs(y = "Metros cuadrados", title = "Boxplot de superficies") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r}
+ggplot(mhp_train, aes(m2)) +
+  geom_histogram(aes(y=..count..), bins = 50, position = "dodge", fill = "#0BB363") +
+  geom_density(alpha=.3, fill = "red") +
+  labs(x = "Metros cuadrados", y = "Número de viviendas", title = "Viviendas por metros cuadrados") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+# Análisis multivariante
+
+Una vez analizadas todas las variables de forma individual, podemos buscar algunas relaciones entre ellas.
+
+Como se ve en los gráficos inferiores hay una relción fuerte entre el precio, los metros cuadradados y el número de habitaciones.
+
+```{r}
+plot_grid(
+  ggcorrplot(cor(mhp_train %>% select_if(is.numeric)),type = "lower", lab=TRUE),
+  
+  ggplot(mhp_train, aes(x = m2, y = price)) +
+  geom_point() +
+  geom_smooth() +
+  ggtitle('Reación precio y m²') +
+  theme(plot.title = element_text(hjust = 0.5)),
+  
+  ggplot(mhp_train, aes(x = rooms, y = price)) +
+  geom_point() +
+  geom_smooth() +
+  ggtitle('Reación precio y habitaciones') +
+  theme(plot.title = element_text(hjust = 0.5)), 
+  
+  ggplot(mhp_train, aes(x = rooms, y = m2)) +
+  geom_point() +
+  geom_smooth() +
+  ggtitle('Reación m² y habitaciones') +
+  theme(plot.title = element_text(hjust = 0.5)), 
+  
+  nrow = 2
+)
+```
+
+Introduciendo algunas de las variables categóricas se puede observar como varía el precio con la superficie o el número de habitaciones dependiendo de si incluye garaje, ascensor u orientación exterior.
+
+```{r}
+plot_grid(
+  ggplot(mhp_train, aes(x = m2, y = price, colour = exterior)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  scale_colour_manual(values = c("1" = "#0BB363", "0" = "#DC143C")) +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6)) +
+  ggtitle('Rel. precio-superficie, exterior') ,
+  
+  ggplot(mhp_train, aes(x = rooms, y = price, colour = exterior)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  scale_colour_manual(values = c("1" = "#0BB363", "0" = "#DC143C")) + 
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6)) +
+  ggtitle('Rel. precio-habitaciones, exterior') ,
+  
+  nrow =1
+)
+```
+
+```{r}
+plot_grid(
+  ggplot(mhp_train, aes(x = m2, y = price, colour = elevator)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  scale_colour_manual(values = c("1" = "#0BB363", "0" = "#DC143C")) +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6)) +
+  ggtitle('Rel. precio-superficie, ascensor'),
+  
+  ggplot(mhp_train, aes(x = rooms, y = price, colour = elevator)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  scale_colour_manual(values = c("1" = "#0BB363", "0" = "#DC143C")) +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6)) +
+  ggtitle('Rel. precio-habitación, ascensor'),
+  
+  nrow =1
+)
+```
+
+```{r}
+plot_grid(
+  ggplot(mhp_train, aes(x = m2, y = price, colour = garage)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  scale_colour_manual(values = c("1" = "#0BB363", "0" = "#DC143C")) +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6)) +
+  ggtitle('Rel. precio-superficie, garaje'),
+  
+  ggplot(mhp_train, aes(x = rooms, y = price, colour = garage)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  scale_colour_manual(values = c("1" = "#0BB363", "0" = "#DC143C")) +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6)) +
+  ggtitle('Rel. precio-habitaciones, garaje'),
+  
+  nrow =1
+)
+```
+
+Representando boxplot por distrito se ve claramente que los barrios ricos como Salamanca o Chamberí, a parte de tener precios medios más altos, tienen mayor número de viviendas con precios atípicos (por encima), mientras que en el número de habitaciones no se aprecia una diferencia tan notoria.
+
+```{r}
+ggplot(mhp_train, aes(district, price)) +
+  geom_boxplot(fill = "#0BB363") +
+  labs(y = "Precio", title = "Boxplot de precios por distrito") +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r}
+ggplot(mhp_train, aes(district, rooms)) +
+  geom_boxplot(fill = "#0BB363") +
+  labs(y = "Habitaciones", title = "Boxplot de habitaciones por distrito") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r}
+ggplot(mhp_train, aes(district, m2)) +
+  geom_boxplot(fill = "#0BB363") +
+  labs(y = "Metros cuadrados", title = "Boxplot de superficie por distrito") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+En las siguientes figuras se representa el precio medio por distrito y como varía con respecto a otras variables de interés.
+
+```{r}
+mhp_train %>%
+  group_by(district, m2) %>%
+  summarize(avg_price = mean(price)) %>%
+  ggplot(aes(x = m2, y = avg_price)) + 
+  geom_point(size = 0.5) +
+  facet_wrap(~ district) + 
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6))
+```
+
+```{r}
+mhp_train %>%
+  group_by(district, exterior) %>% 
+  summarise(avg_price = mean(price)) %>%
+  ggplot(aes(x=district, y=avg_price, fill=exterior)) +
+  geom_bar(stat = "identity", position = "dodge") + 
+  scale_fill_manual(values = c("1" = "#0BB363", "0" = "#DC143C")) +
+  ggtitle("Precio medio por distrito y exterior") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 30, hjust = 1)) + 
+  labs(x = "Distrito", y = "Precio medio") + 
+  scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6))
+```
+
+```{r}
+mhp_train %>%
+  group_by(district, elevator) %>% 
+  summarise(avg_price = mean(price)) %>%
+  ggplot(aes(x=district, y=avg_price, fill=elevator)) +
+  geom_bar(stat = "identity", position = "dodge") + 
+  scale_fill_manual(values = c("1" = "#0BB363", "0" = "#DC143C")) +
+  ggtitle("Precio medio por distrito y ascensor") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 30, hjust = 1)) + 
+  labs(x = "Distrito", y = "Precio medio") + 
+  scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6))
+```
+
+```{r}
+mhp_train %>%
+  group_by(district, garage) %>% 
+  summarise(avg_price = mean(price)) %>%
+  ggplot(aes(x=district, y=avg_price, fill=garage)) +
+  geom_bar(stat = "identity", position = "dodge") + 
+  scale_fill_manual(values = c("1" = "#0BB363", "0" = "#DC143C")) +
+  ggtitle("Precio medio por distrito y garaje") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 30, hjust = 1)) + 
+  labs(x = "Distrito", y = "Precio medio") + 
+  scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6))
+```
+
+# Procesado de variables cualitativas
+
+```{r}
+mhp_train %>%
+  group_by(house_type) %>%
+  summarise(precio_medio = mean(price)) %>%
+  arrange(precio_medio)
+```
+
+Para el posterior análisis transformamos la columna house_type, agrupando en "piso" (independientemente de la planta en la que esté), "casa" (casa o chalet) y "sotano".
+
+```{r}
+mhp_train <- mhp_train %>%
+  mutate(tipo_casa = case_when(
+    grepl("casa|chalet", house_type, ignore.case = TRUE) ~ "casa",
+    grepl("\\bplanta\\s*-?1\\b|semi-?sotano|bajo|sotano", house_type, ignore.case = TRUE) ~ "sotano",
+    TRUE ~ "piso"
+  ))
+mhp_train$tipo_casa <- as.factor(mhp_train$tipo_casa)
+```
+
+También se agruparán los distritos en función del precio medio del mismo: caro, medio o barato.
+
+```{r}
+mhp_train <- mhp_train %>%
+  group_by(district) %>%
+  mutate(precio_distrito = mean(price)) %>%
+  ungroup()
+
+# Calcular los percentiles
+percentiles <- quantile(mhp_train$precio_distrito, probs = c(0, 1/3, 2/3, 1))
+
+# Asignar etiquetas
+mhp_train$precio_distrito <- cut(mhp_train$precio_distrito, breaks = percentiles, labels = c("barato", "medio", "caro"), include.lowest = TRUE)
+```
+
+Además, de cara a desarrollar algunos modelos, se creará una variable target binaria que dividirá las casas entre "cara" y "barata" (1/0).
+
+```{r}
+mhp_train$precio_bin <- ifelse(mhp_train$price > median(mhp_train$price), "cara", "barata")
+mhp_train$precio_bin = ifelse(mhp_train$precio_bin == "cara", 1, 0)
+mhp_train$precio_bin = factor(mhp_train$precio_bin, levels = c(1,0))
+```
+
+```{r}
+# Aplicamos todos los cambios también a test.
+
+# Categorizamos house_type
+mhp_test <- mhp_test %>%
+  mutate(tipo_casa = case_when(
+    grepl("casa|chalet", house_type, ignore.case = TRUE) ~ "casa",
+    grepl("\\bplanta\\s*-?1\\b|semi-?sotano|bajo|sotano", house_type, ignore.case = TRUE) ~ "sotano",
+    TRUE ~ "piso"
+  ))
+mhp_test$tipo_casa <- as.factor(mhp_test$tipo_casa)
+
+# Categorizamos los distritos
+mhp_test <- mhp_test %>%
+  group_by(district) %>%
+  mutate(precio_distrito = mean(price)) %>%
+  ungroup()
+
+percentiles <- quantile(mhp_test$precio_distrito, probs = c(0, 1/3, 2/3, 1))
+
+mhp_test$precio_distrito <- cut(mhp_test$precio_distrito, breaks = percentiles, labels = c("barato", "medio", "caro"), include.lowest = TRUE)
+
+# Creamos variable target
+mhp_test$precio_bin <- ifelse(mhp_test$price > median(mhp_test$price), "cara", "barata")
+mhp_test$precio_bin = ifelse(mhp_test$precio_bin == "cara", 1, 0)
+mhp_test$precio_bin = factor(mhp_test$precio_bin, levels = c(1,0))
+```
+
+# Modelo de regresión lineal
+
+Con el dataset ya preparado, se crea un modelo de regresión lineal.
+
+En este caso, tras hacer diversas pruebas se ha optado por introducir sólo 3 variables (tipo_casa, m2 y precio_distrito), alcanzando un R2 de 0.7553.
+
+Esta cifra podía incrementarse algo, sin embargo es a costa de introducir más variables y por tanto más complejidad al modelo, haciéndolo menos explicable.
+
+```{r}
+lm_fit <- lm(price ~ m2+tipo_casa+precio_distrito, data=mhp_train)
+summary(lm_fit)
+coef(lm_fit)
+```
+
+```{r}
+residuals=lm_fit$residuals
+autoplot(lm_fit)
+```
+
+Observando los residuos se ve como hay cierta heterocedasticidad y en la gráfica QQ no se ajustan a la normal, por lo que el módelo no es bueno.
+
+```{r}
+# Realizar predicciones en la partición test
+predictions <- predict(lm_fit, newdata = mhp_test)
+
+# Comparar las predicciones con los valores reales
+rmse <- rmse(predictions, mhp_test$price)
+mae <- mae(predictions, mhp_test$price)
+r2 <- R2(predictions, mhp_test$price)
+
+# Imprimir las métricas de evaluación
+cat(paste0("RMSE: ", round(rmse, 2), "\n"))
+cat(paste0("MAE: ", round(mae, 2), "\n"))
+cat(paste0("R-squared: ", round(r2, 2)))
+```
+
+Un R2 de 0.73 (bastante similar al calculado en train) indica que se explica con esa probabilidad la variabilidad de la variable dependiente, por lo tanto podríamos considerarlo razonablemente útil, sin embargo sería preferible mejorar los valores del error de predicción promedio o el cuadrático.
+
+# Conclusiones preliminares
+
+El análisis realizado hasta el momento ha servido para familiarizarse con el mercado inmobiliario de Madrid (o al menos parte de él) y conocer como se comportan algunas de las variables más relevantes en el valor de las viviendas.
+
+Con estos conocimientos se abordarán nuevos modelos para intentar conseguir mejores predicciones y simultaneamente comprender y desarrollar estos mismos modelos.
+
+```{r}
+str(mhp_train)
+```
+
+# Aprendizaje no supervisado
+
+## K-Means
+
+El algoritmo K-Means es un método de aprendizaje automático no supervisado utilizado para el análisis de agrupamiento o "clustering". El objetivo principal de este algoritmo es dividir los datos en K grupos (clusters), de modo que los puntos dentro de un mismo grupo sean lo más similares posible.
+
+Por como funciona este método, es habitual utilizarlo en la etapa de EDA para agrupar y etiquetar observaciones con un criterior más científico que el basado en el conocimiento personal del dominio, más que para hacer predicciones (aunque también puede hacerse).
+
+En nuestro lo utilizaremos para comprobar si hay alguna forma mejor de agrupar las casas de como lo hemos hecho anteriormente.
+
+```{r}
+mhp_train_kmeans <- subset(mhp_train, select = c("m2", "rooms", "elevator", "garage", "exterior"))
+
+mhp_train_kmeans$exterior <- as.numeric(mhp_train_kmeans$exterior)
+mhp_train_kmeans$elevator <- as.numeric(mhp_train_kmeans$elevator)
+mhp_train_kmeans$garage <- as.numeric(mhp_train_kmeans$garage)
+
+# Normalizamos los datos
+mhp_train_kmeans <- scale(mhp_train_kmeans)
+```
+
+Tras normalizar los datos, aplicamos k-means sólo para las variables numéricas y mediante los siguientes test decidiremos cual es el número óptimo de clusters.
+
+```{r}
+fviz_nbclust(mhp_train_kmeans, kmeans, method = "wss")
+fviz_nbclust(mhp_train_kmeans, kmeans, method = "silhouette")
+```
+
+Utilizando la regla del codo en el gráfico wss podríamos decir que está en el 6, algo que confirma el segundo gráfico. Por lo tanto, aplicamos el modelo con K = 6
+
+```{r}
+# Definir el número de grupos
+k <- 6
+
+# Ejecutar k-means
+grupos <- kmeans(mhp_train_kmeans, k)
+
+mhp_train$cluster <- as.factor(grupos$cluster)
+
+# Graficar la relación entre las características y los grupos
+ggplot(mhp_train, aes(x=m2, y=price, color=cluster)) + 
+  geom_point() +
+  ggtitle("Grupos de casas en venta") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6)) +
+  xlab("Tamaño en m2") +
+  ylab("Precio")
+```
+
+```{r}
+fviz_cluster(grupos, data = mhp_train_kmeans, ellipse.type = "euclid",repel = TRUE,star.plot = TRUE)
+fviz_cluster(grupos, data = mhp_train_kmeans, ellipse.type = "norm")
+```
+
+Graficamente es difícil diferenciar las agrupaciones, por lo que en la tabla inferior obtenemos los precios medios de cada cluster, donde se puede apreciar que la gran mayoría de agrupaciones son coherentes (salvo tal vez el 2 y el 3 que son muy similares).
+
+También se muestra el tipo de casa y el distrito predominante en cada cluster.
+
+```{r}
+# Precio medio por cluster
+mhp_train %>%
+  group_by(cluster) %>%
+  summarise(precio_medio = mean(price))
+
+# Tipo de casa predominante por cluster
+mhp_train %>%
+  group_by(cluster, tipo_casa) %>%
+  summarise(frecuencia = n()) %>%
+  arrange(cluster, desc(frecuencia)) %>%
+  #slice(1) %>%
+  select(cluster, tipo_casa_predominante = tipo_casa)
+
+# Distrito predominante por cluster
+mhp_train %>%
+  group_by(cluster, district) %>%
+  summarise(frecuencia = n()) %>%
+  arrange(cluster, desc(frecuencia)) %>%
+  #slice(1) %>%
+  select(cluster, distrito_predominante = district)
+```
+
+Sabemos que tanto la regla del codo como cualquier otro método para definir el número de clusters no siempre es adecuada, por lo que a continuación se prueba con un bucle que prueba con número de clusters menores que 6 y muestra las agrupaciones por precio y tipo de piso anteriores.
+
+```{r}
+# Ejecuta k-means para diferentes valores de K
+for (k in 2:6) {
+  # Ejecutar k-means
+  grupos <- kmeans(mhp_train_kmeans, centers = k)
+  mhp_train$cluster <- as.factor(grupos$cluster)
+  
+  print(k)
+  
+  print(mhp_train %>%
+  group_by(cluster) %>%
+  summarise(precio_medio = mean(price)))
+  
+  print(mhp_train %>%
+  group_by(cluster, tipo_casa) %>%
+  summarise(frecuencia = n()) %>%
+  arrange(cluster, desc(frecuencia)) %>%
+  #slice(1) %>%
+  select(cluster, tipo_casa_predominante = tipo_casa))
+}
+```
+
+Observando las diferencias entre los diferentes modelos, el número de clusters que mejor diferencia las casas por su precio es 3, algo que encaja con la presunción que inicial que hicimos para dividir los tipos de casa en 3 tipos.
+
+Si observamos además el tipo de casas más común por cluster, casi siempre es piso (salvo en los casos de clusters con muy poco precio medio, que es sótano), lo cual aunque tiene sentido porque este tipo es claramente mayoritario en todo el dataset, no nos permite apreciar a simple vista donde se acumulan el resto de viviendas.
+
+Por lo tanto, entre los datos extraídos del análisis de clusters y el conocimiento previo que teníamos del dominio, tiene sentido mantener los 3 tipos de viviendas principales como variable para los siguientes modelos (sótano, piso y casa).
+
+# Técnicas de reducción de la dimensionalidad
+
+## PCA
+
+El Análisis de Componentes Principales es una técnica de reducción de la dimensionalidad que se utiliza para transformar un conjunto de datos de múltiples variables en un nuevo conjunto de datos con un número menor de variables cuyo principal objetivo es simplificar la representación de datos mientras se conserva la mayor cantidad de información y variabilidad posible identificando patrones y estructuras subyacentes, reduciendo la multicolinealidad y el sobreajuste.
+
+PAra nuestro dataset, seleccionaremos las columnas numéricas, descartando la columna precio puesto que será de alguna manera nuestra variable dependiente. Además creamos 3 variables dummy usando variables categóricas de tipo 0|1.
+
+```{r}
+train_pca <- mhp_train[,c(3:7,10,11,12)]
+```
+
+```{r}
+dummy_garaje <- model.matrix(~0 + garage,data = train_pca)
+dummy_exterior <- model.matrix(~0 + exterior, data = train_pca)
+dummy_ascensor <- model.matrix(~0 + elevator, data = train_pca)
+dummy_tipo_casa <- model.matrix(~0 + tipo_casa, data = train_pca)
+dummy_distrito <- model.matrix(~0 + precio_distrito, data = train_pca)
+```
+
+```{r}
+dummy_data <- cbind(train_pca[, c("rooms", "m2")],dummy_exterior,dummy_garaje,dummy_ascensor,dummy_distrito,dummy_tipo_casa)
+```
+
+```{r}
+prcomp(dummy_data)
+```
+
+Podemos observar que en la PC1 lleva un peso casi de 100 la variable m2, mientras que en PC2 pasa lo mismo con la variable rooms. En el resto de PCs el análisis de componentes principales está algo más repartido.
+
+```{r}
+summary(prcomp(dummy_data))
+```
+Al hacer un summary de las variables vemos que la proporción de varianza explicada por la primera componente es de un 99%, es decir, que es la única relevante. 
+Si nos fijamos vemos que la PC1 está explicada casi al 100% por los m2. En nuestra tabla vemos que los m2 tienen valores mucho más altos que el resto de variables. Por lo tanto, lo que hacemos a continuación es un análisis pero escalando las variables.
+
+```{r}
+prcomp(dummy_data, scale = T)
+```
+
+Tras escalar las variables podemos observar que están mucho más repartidos los pesos en las componentes principales debido a que estás asegurando que todas las variables tengan la misma importancia en el análisis, independientemente de sus escalas originales y unidades de medida. Con esto evitas el dominio de variables con mayor magnitud y mejoras la interpretación de resultados. 
+
+```{r}
+pca_result <- prcomp(dummy_data, center = TRUE, scale = TRUE)
+summary(pca_result)
+```
+
+Observamos que con PC6 ya llegamos al 88% de la proporción de varianza explicada pero vemos algunos saltos interesantes. Para ver cuantas componentes explican el modelo hacemos la regla de codo, método heurístico para determinar el número óptimo de clusters en un conjunto de datos.
+
+Al observar el gráfico vemos que la forma del codo sería en la 6|7 aunque  el gráfico no es muy claro. 
+
+```{r}
+summary_pca <- summary(pca_result)
+var_exp <- summary_pca$importance[2,]
+
+barplot(var_exp, col = "#0BB363",
+        main = "Gráfico PCA - Variance explained",
+        xlab = "Principal Components",
+        ylab = "Proportion of Variance Explained")
+
+lines(var_exp, col = "#DC143C", type = "l", lwd = 2)
+
+points(var_exp, col = "#DC143C", pch = 20, cex = 1.2)
+```
+
+
+A modo de ejercicio para comprender el funcionamiento de PCA puede resultar útil hacer estos cálculos, sin embargo para el dataset en cuestión ya se pueden formar modelos robustos con muy pocas variables (los m2 de superficie, por ejemplo, ya son suficientes para predecir un gran porcentaje de precios).
+
+# Aprendizaje supervisado
+
+## GLM
+
+En aprendizaje automático, GLM (Generalized Linear Models) se refiere a una clase de modelos lineales que se utilizan para predecir una variable respuesta a partir de una o más variables explicativas. Tiene tres componentes: Variable respuesta, función de enlace y función lineal sistemática, y son muy útiles para utilizarse en clasificación, regresión y problemas de predicción.
+
+Aplicado a nuestro dataset, lo utilizaremos para predecir el precio binario de las casas (cara/barata).
+
+```{r}
+train_glm <- mhp_train[,c(3:7,10,11,12)]
+test_glm <- mhp_test[,c(3:7,10,11,12)]
+```
+
+```{r}
+train_glm[,2:3]<- scale(train_glm[,2:3])
+test_glm[,2:3]<- scale(test_glm[,2:3])
+```
+
+Tras seleccionar las variables y normalizarlas para que todas tengan el mismo peso, desarrollamos el modelo con la variable de respuesta "precio_bin" y las variables independientes "exterior", "garage", "elevator", "rooms", "precio_distrito" y "tipo_casa", usando una distribución binomial. 
+
+```{r}
+glm_mhp = glm(formula = precio_bin ~ exterior + garage + elevator + rooms + m2 + precio_distrito + tipo_casa,
+                 data = train_glm, 
+                 family = binomial)
+summary(glm_mhp)
+```
+Tras realizar muchas comprobaciones y probar de maneras diversa el modelo no conseguimos interpretar bien los datos. No somos capaces de entender por qué sale inversamente proporcional los m2,el precio distrito mdio y el caro, que precisamente son las 3 variables que más definen que una casa sea cara, entonces no entendemos qué significa en este caso que salgan negativas. Lo dejamos pendiente para que por favor nos expliqueis a qué se puede deber esto y así saberlo para futuras ocasiones.
+
+```{r}
+head(predict(glm_mhp))
+```
+Esto sirve para predecir la probabilidad logit ajustado previamente y para mostrar las primeras seis predicciones. Cada número representa la probabilidad logit de que la variable dependiente "precio_bin" sea igual a 1 para cada observación en el conjunto de datos.
+
+```{r}
+ajustados <- fitted(glm_mhp)
+head(fitted(glm_mhp))
+```
+
+Aquí obtenemos las probabilidades ajustadas que representan las probabilidades estimadas de que la variable dependiente "precio_bin" sea igual a 1 para cada observación en el conjunto de datos.
+
+Gráficos de residuales: Estos gráficos permiten evaluar la calidad del ajuste del modelo. Puedes trazar residuales de Pearson, deviance, o residuales estandarizados frente a las predicciones ajustadas o valores ajustados para examinar si hay patrones en los residuales. Un buen ajuste del modelo no mostrará patrones claros en los residuales.
+
+```{r}
+residuales <- residuals(glm_mhp, type = "pearson")
+head(residuales)
+```
+
+```{r}
+data_residuales <- data.frame(Residuales = residuales, Ajustados = ajustados)
+ggplot(data_residuales, aes(x = Ajustados, y = Residuales)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Gráfico de residuales", x = "Valores ajustados", y = "Residuales") + ylim(-10,10)
+```
+
+```{r}
+predicciones_glm <- ifelse(test = glm_mhp$fitted.values > 0.5, no = 0, yes = 1)
+matriz_confusion_glm <- table(glm_mhp$model$precio_bin, predicciones_glm,
+                          dnn = c("observaciones", "predicciones"))
+matriz_confusion_glm
+```
+
+Finalmente generamos predicciones binarias basadas en las probabilidades ajustadas del modelo lineal generalizado y creamos una matriz de confusión para evaluar el rendimiento del modelo donde se muestra la distribución de las predicciones correctas e incorrectas en función de las observaciones reales y las predichas.
+
+Obersvamos que el modelo no acierta nada, esto imagino que estará relacionado con lo anterior que no llegamos a entender.
+
+La matriz se lee de la siguiente manera:
+
+-   Verdaderos negativos (VN): La esquina superior izquierda representa el número de observaciones clasificadas correctamente como "0" (clase negativa).
+
+-   Falsos positivos (FP): La esquina superior derecha representa el número de observaciones que en realidad eran "0" pero fueron clasificadas incorrectamente como "1" (clase positiva) por el modelo.
+
+-   Falsos negativos (FN): La esquina inferior izquierda representa el número de observaciones que en realidad eran "1" pero fueron clasificadas incorrectamente como "0" por el modelo. 
+
+-   Verdaderos positivos (VP): La esquina inferior derecha  representa el número de observaciones clasificadas correctamente como "1".
+
+## KNN
+
+El modelo KNN (K-Nearest Neighbors) es un algoritmo de aprendizaje supervisado que se utiliza tanto para clasificación como para regresión. Es un método basado en instancias que no hace supuestos sobre la forma funcional de la relación entre las variables independientes y la variable dependiente. KNN utiliza la información de los vecinos más cercanos para realizar predicciones. Para ello calcula distancias como la Euclidiana, Manhattan, Minkowski, etc...
+
+La idea detrás de KNN es simple, una observación se clasifica o se le asigna un valor basado en las características de sus K vecinos más cercanos.
+
+Algunas ventajas del algoritmo KNN son su simplicidad o su capacidad para manejar relaciones no lineales entre variables. Sin embargo también tiene algunas desventajas, como su sensibilidad a la maldición de la dimensionalidad, el efecto de las variables irrelevantes y el costo computacional asociado con el cálculo de distancias en conjuntos de datos grandes.
+
+Procedemos al cálculo de este modelo e intentamos ver si hay un número correcto de k-vecinos que podemos usar.
+
+```{r}
+long = 15
+accuracy = rep(0,long)
+f1score = rep(0,long)
+recall = rep(0,long)
+precision = rep(0,long)
+for (i in 1:long)
+{
+  prediccion_knn_cv =knn.cv(mhp_train[,c("exterior","rooms","m2","elevator", "garage")], 
+                            k=i, cl=mhp_train$precio_bin)
+  accuracy[i] = sum(prediccion_knn_cv == mhp_train$precio_bin) /nrow(mhp_train)
+  recall[i] = sum(prediccion_knn_cv == mhp_train$precio_bin & mhp_train$precio_bin == TRUE) / sum(mhp_train$precio_bin == TRUE)
+  precision[i] = sum(prediccion_knn_cv == mhp_train$precio_bin & prediccion_knn_cv == TRUE) / sum(prediccion_knn_cv == TRUE)
+  f1score[i] = 2*precision[i]*recall[i]/(precision[i]+recall[i])
+}
+resultados_knn = as.data.frame(cbind(accuracy,f1score,precision,recall))
+resultados_knn = resultados_knn %>% mutate(index=as.factor(seq(1:long)))
+
+max(resultados_knn$f1score)
+which.max(resultados_knn$f1score)
+
+
+ggplot(data=resultados_knn,aes(x=index,y=accuracy)) + 
+  geom_col(colour="cyan4",fill="cyan3")+
+  ggtitle("Accuracy")
+
+
+ggplot(data=resultados_knn,aes(x=index,y=f1score)) + 
+  geom_col(colour="orange4",fill="orange3") +
+  ggtitle("F1_score values")
+
+```
+
+Tratamos de encontrar el valor óptimo de k utilizando validación cruzada. Se calculan varias métricas de evaluación, como precisión, recall y F1-score, para cada valor de k y finalmente tratamos de graficar la precisión en función del valor de k, pero analizando el gráfico no observamos ninguna diferencia, así que cogemos 5, que es el tamaño por convención que se suele coger.
+
+Pasamos a realizar predicciones en el conjunto de datos de entrenamiento y en el de test además de realizar la matriz de confusión.
+
+```{r}
+# En train
+prediccion_knn5_train <- knn.cv(mhp_train[,c("exterior","rooms","m2","elevator", "garage")], 
+                              k=5, cl=mhp_train$precio_bin, prob = TRUE)
+confusionMatrix(table(prediccion_knn5_train,mhp_train$precio_bin), positive= "1")
+
+#En test  
+prediccion_knn5_test <- knn(mhp_train[,c("exterior","rooms","m2","elevator", "garage")], mhp_test[,c("exterior","rooms","m2","elevator", "garage")],
+                         k=5, cl=mhp_train$precio_bin, prob = TRUE)
+confusionMatrix(table(prediccion_knn5_test,mhp_test$precio_bin), positive= "1")
+```
+
+La matriz de confusión en train nos muestra la cantidad de predicciones correctas e incorrectas de cada clase (1 y 0) en el conjunto de entrenamiento.
+
+-   Accuracy (exactitud): 0.8482. Es la proporción de predicciones correctas en el conjunto de entrenamiento. En otras palabras, el modelo KNN clasifica correctamente el 84.82% de las observaciones del conjunto de entrenamiento.
+
+-   Kappa: 0.6963. El índice kappa mide la concordancia entre las predicciones y los valores reales. Un kappa de 1 indica una concordancia perfecta, mientras que un kappa de 0 indica una concordancia totalmente aleatoria. Nuestro kappa de 0.6963 muestra una buena concordancia entre las predicciones y los valores reales en el conjunto de entrenamiento.
+
+-   Mcnemar's Test P-Value: 0.003201. Esta prueba evalúa si hay una diferencia significativa entre las predicciones falsas positivas y las predicciones falsas negativas. 
+
+La matriz de confusión en test nos muestra valores muy parecidos en los indicadores anteriores lo que nos lleva a pensar que el modelo tiene un rendimiento consistente y generaliza bien lo datos ya que el modelo clasifica correctamente las observaciones y no parece sobreajustado.
+
+Hemos realizado diferentes pruebas quitando variables y se observa que si quitamos la variable m2 nos dice que hay muchos empates. Sin embargo, quitando las otras variables el acierto en train y test varía.
+
+Obteniendo más o menos un 84% de acierto creemos que nos puede servir para clasificar las nuevas casas que entrasen en el dataset, puesto que no hemos sido capaces de mejorar ese %.
+
+## DECISION TREES
+
+El modelo de Árbol de Decisión es un algoritmo de aprendizaje supervisado que funciona dividiendo iterativamente el conjunto de datos en subconjuntos basados en las características del mismo. Al final de este proceso, se genera un árbol con nodos y hojas que representan las divisiones y las decisiones.
+
+Algunas características importantes de los árboles de decisión son la interpretabilidad, capacidad para manejar datos no lineales, el poco preprocesamiento de los datos, la sensibilidad a datos desequilibrados y el posible sobreajuste en el caso de hacer un arbol con demasiadas ramificaciones.
+
+A continuación hacemos el modelo de arbol de decisión. 
+
+```{r}
+arbol <- rpart(precio_bin ~ garage + elevator + rooms + tipo_casa + precio_distrito, data = mhp_train, control = rpart.control(minsplit = 1))
+fancyRpartPlot(arbol, sub = "")
+```
+
+Para evaluar el modelo utilizamos la función predict sobre el conjunto test usando el argumento type = "class" que indica que se espera una salida categórica creandose una tabla de contingencias "tab1" con las predicciones que coinciden o no respecto a las observaciones reales.
+
+Calculamos y obtenemos el número 0.8396275 que representa la tasa de acierto (accuracy) del modelo. El Árbol de Decisión hizo predicciones correctas en casi el 84% de los casos en el conjunto de datos de prueba. Nos parece un porcentaje bastante aceptable.
+
+```{r}
+tab1 = table(pred = predict(arbol, mhp_test, type = "class"),
+obs = mhp_test$precio_bin)
+ntest = nrow(mhp_test)
+acierto1 = sum(diag(tab1))/ntest
+acierto1
+```
+
+Siguiendo con la validación del modelo podemos usar las funciones *printcp* y *plotcp* que se utilizan para analizar la complejidad y el rendimiento usando el "pruning" o poda de ramas del arbol que a menudo reduce su complejidad y permite una mejor generalización del mismo disminuyendo el subreajuste.
+
+La función **printcp** es una función que muestra una tabla que contiene información sobre la complejidad y la tasa de error en diferentes niveles de tamaño del árbol proporcionando una visión general de cómo cambia el rendimiento a medida que aumenta la complejidad. El valor de cp ha de ser tal que la tasa de error de validación cruzada sea mínima.
+
+La función **plotcp** crea un gráfico de la tasa de error. Este gráfico es útil para visualizar cómo se comporta el rendimiento del árbol a medida que aumenta su tamaño y ayuda a decidir qué tamaño de árbol es el más apropiado para el problema en cuestión.
+
+```{r}
+printcp(arbol)
+```
+
+Obtenidos los resultados, pasamos a analizarlos:
+
+-   CP (Cost Complexity): Mide la complejidad asociado con cada nivel de poda en el árbol de decisión. Un CP más pequeño indica una complejidad menor.
+-   nsplit: Número de divisiones (splits) realizadas hasta el momento en el árbol.
+-   rel error: Error relativo en cada etapa de poda del árbol.
+-   xerror: Error de validación cruzada (cross-validated) estimado para el árbol en cada etapa de poda.
+-   xstd: Desviación estándar del error de validación cruzada (xerror).
+
+En base a los resultados presentados, se puede observar que el árbol sin poda tiene un error relativo de 1.0 y un error de validación cruzada de 1.0189.
+A medida que se realizan más divisiones en el árbol el CP disminuye y también lo hace el error relativo y el error de validación cruzada.
+
+Para seleccionar el árbol óptimo, generalmente se busca el CP más pequeño que tenga un error de validación cruzada dentro de una desviación estándar del mínimo error de validación cruzada.
+
+```{r}
+arbol$cptable[which.min(arbol$cptable[, "xerror"]),
+"CP"]
+```
+
+El propósito es identificar el mejor árbol de decisión con respecto a su capacidad de generalización en datos no vistos. La función **which.min()** devuelve el índice del valor mínimo en la columna "xerror" de la tabla de complejidad cptable del árbol de decisión. Luego, con ese índice, se extrae el valor correspondiente de la columna "CP" en la tabla de complejidad.
+
+
+```{r}
+plotcp(arbol)
+```
+Podamos el árbol como indica la función. 
+
+```{r}
+pruneTREE1 = prune(arbol, cp = arbol$cptable[which.min(arbol$cptable[,
+"xerror"]), "CP"])
+fancyRpartPlot(pruneTREE1, uniform = TRUE, main = "Pruned Classification Tree",
+sub = "")
+```
+
+```{r}
+pruneTREE2 = prune(arbol, cp = arbol$cptable[5, "CP"])
+fancyRpartPlot(pruneTREE2, uniform = TRUE, main = "Pruned Classification Tree",
+sub = "")
+```
+
+```{r}
+tab2 = table(pred = predict(pruneTREE2, mhp_test, type = "class"),
+obs = mhp_test$precio_bin)
+acierto2 = sum(diag(tab2))/ntest
+acierto2
+```
+Tras la poda nos sale literalmente es mismo resultado.
+
+Creamos la matriz de confusión. 
+
+```{r}
+prediccion_1 <- predict(arbol, newdata = mhp_train, type = "class")
+```
+
+```{r}
+confusionMatrix(prediccion_1, mhp_train[["precio_bin"]])
+```
+
+Los resultados en la matriz de confusión son los siguientes:
+
+-   Verdaderos positivos (VP): 3246
+-   Verdaderos negativos (VN): 3250
+-   Falsos positivos (FP): 619
+-   Falsos negativos (FN): 617
+
+También obtenemos:
+
+-   Accuracy (exactitud): 84.01% de predicciones correctas.
+-   Kappa: 68.03% 
+-   Sensitivity (sensibilidad): 0.8403. También conocida como recall o tasa verdadera positiva, mide la proporción de casos positivos que se identificaron correctamente.
+-   Specificity (especificidad): 0.8400. Mide la proporción de casos negativos que se identificaron correctamente. Un valor más alto es mejor.
+-   Pos Pred Value (valor predictivo positivo): 0.8398. Mide la proporción de predicciones positivas que son realmente positivas. Un valor más alto es mejor.
+-   Neg Pred Value (valor predictivo negativo): 0.8404. Mide la proporción de predicciones negativas que son realmente negativas. Un valor más alto es mejor.
+-   Mcnemar's Test P-Value: 0.9773. Esta prueba compara las diferencias entre los falsos positivos y los falsos negativos. Un valor alto de "p" (como en este caso) sugiere que no hay una diferencia significativa entre ellos.
+
+En resumen, este modelo de árbol de decisión podado tiene una exactitud del 84.01% y un coeficiente kappa de 0.6803, lo que indica un buen rendimiento en la clasificación.
+
+Sin embargo para este modelo se han tenido en cuenta bastantes variables, y aunque el rendimiento es bueno, se puede alcanzar un rendimiento casi igual utilizando sólo los metros cuadrados, como se puede ver a continuación
+
+```{r}
+arbol <- rpart(precio_bin ~ m2, data = mhp_train, control = rpart.control(minsplit = 1))
+fancyRpartPlot(arbol, sub = "")
+```
+
+```{r}
+tab1 = table(pred = predict(arbol, mhp_test, type = "class"),
+obs = mhp_test$precio_bin)
+ntest = nrow(mhp_test)
+acierto1 = sum(diag(tab1))/ntest
+acierto1
+```
+
+Esta es una forma simple de confirmar la relevancia que tiene la superficie de una casa sobre su precio final, en contraste con otras variables como el tener ascensor o garaje. Además, esto nos deja un modelo mucho más simple y explicable.
+
+## RANDOM FOREST
+
+Algoritmo de aprendizaje supervisado que se basa en la construcción de múltiples árboles de decisión durante el entrenamiento y la combinación de sus resultados para hacer una predicción. El objetivo principal de este enfoque es mejorar la precisión y la robustez del modelo en comparación con un único árbol de decisión.
+
+El funcionamiento de un algoritmo Random Forest sería el siguiente:
+
+-   Seleccionar muestras de arranque: El algoritmo selecciona aleatoriamente un subconjunto de muestras del conjunto de datos de entrenamiento, con reemplazo. 
+    Esto significa que una muestra puede ser seleccionada más de una vez.
+
+-   Crear un árbol de decisión: Se crea un árbol de decisión utilizando el subconjunto de muestras seleccionado. Durante la construcción del árbol, en cada división del nodo, se selecciona un subconjunto aleatorio de características como candidatas para la división. 
+    La mejor división se elige en función de la medida de impureza como la entropía o el índice de Gini. Esto introduce aleatoriedad adicional en el proceso, lo que ayuda a reducir la correlación entre los árboles.
+
+-   Repetir: El proceso se repite varias veces (número de árboles especificado) para construir un conjunto de árboles de decisión.
+
+-   Combinar las predicciones: Para hacer una predicción en un nuevo caso, el algoritmo Random Forest ejecuta todos los árboles individualmente y luego combina sus               resultados. En el caso de la clasificación, la clase con más votos (predicciones) de todos los árboles se elige como la predicción final.
+
+Pasamos a construir el modelo comenzando con 10 árboles aleatórios.
+
+```{r}
+# Escalamos la columna 4 en train y test
+set.seed(19042023)
+mhp_train_scaled <- mhp_train
+mhp_train_scaled[, 4] <- scale(mhp_train[, 4])
+
+mhp_test_scaled <- mhp_test
+mhp_test_scaled[, 4] <- scale(mhp_test[, 4])
+
+# Nos quedamos con todas las variables menos barrio y distrito porque hay muchas categorias
+# Cogemos solo 10 árboles en el parámetro ntree
+classifier <- randomForest(x = mhp_train_scaled[, c(3, 4, 5, 6, 7, 10,11)],
+                           y = mhp_train_scaled$precio_bin,
+                           ntree = 10)
+```
+
+```{r}
+# Predicción de los resultados con el conjunto de testing
+y_pred = predict(classifier, newdata = mhp_test_scaled[,c(3,4,5,6,7,10,11)])
+```
+
+```{r}
+confusionMatrix(y_pred, mhp_test_scaled[["precio_bin"]])
+```
+Ahora probamos con 100 árboles aleatorios para ver si cambia mucho el resultado. 
+
+```{r}
+set.seed(19042022)
+classifier <- randomForest(x = mhp_train_scaled[, c(3, 4, 5, 6, 7, 10,11)],
+                           y = mhp_train_scaled$precio_bin,
+                           ntree = 100)
+```
+
+```{r}
+y_pred = predict(classifier, newdata = mhp_test_scaled[,c(3,4,5,6,7,10,11)])
+```
+
+
+```{r}
+confusionMatrix(y_pred, mhp_test_scaled[["precio_bin"]])
+```
+
+La precisión del modelo es del 0,9077 y el intervalo de confianza del 95% es (0,8908, 0,9099), lo que indica que podemos estar bastante seguros de que la precisión real del modelo está dentro de este rango. El valor de kappa de 0,8013 indica que hay una buena concordancia entre las predicciones del modelo y las observaciones reales.
+
+Además, la sensibilidad del modelo es del 0,8670 y la especificidad del 0,9343. La tasa de detección es del 0,4335 y la prevalencia es del 0,5000. En general, el modelo tiene un desempeño bastante bueno en la clasificación de las viviendas por encima y por debajo del umbral.
+
+## SVM
+
+Support Vector Machine, algoritmo de aprendizaje supervisado que se utiliza tanto para problemas de clasificación como de regresión. En el caso de la clasificación, el objetivo principal de SVM es encontrar el hiperplano óptimo que separa los datos en diferentes clases. Un hiperplano es un límite de decisión que divide el espacio de características en dos partes, de modo que cada parte contenga puntos de datos de una clase específica. En el caso de la regresión, SVM busca encontrar una función que tenga el menor error de ajuste posible.
+
+El algoritmo SVM funciona de la siguiente manera:
+
+-   Encuentra el hiperplano óptimo: El algoritmo busca el hiperplano que tenga el margen máximo entre las dos clases. El margen es la distancia entre el hiperplano y los puntos de datos más cercanos a él, llamados "vectores de soporte". Estos vectores de soporte son los puntos de datos que definen el límite de decisión y son fundamentales para el proceso de SVM.
+
+-   Solución de un problema de optimización: La búsqueda del hiperplano óptimo implica la solución de un problema de optimización convexa. Este problema se resuelve mediante técnicas de optimización como el método de Lagrange o el algoritmo de optimización secuencial mínima (SMO).
+
+-   Transformación a través del kernel: En casos en los que los datos no son linealmente separables en el espacio de características original, SVM puede utilizar una función de kernel para transformar los datos en un espacio de características de mayor dimensión donde se puedan separar linealmente. Los kernels comunes incluyen el kernel          lineal, el kernel polinómico, el kernel de base radial (RBF) y el kernel sigmoide. La elección del kernel adecuado es crucial para el rendimiento del modelo SVM.
+
+-   Clasificación: Para hacer una predicción en un nuevo punto de datos, el algoritmo SVM evalúa la posición del punto con respecto al hiperplano óptimo. Si el punto está por encima del hiperplano, se asigna a una clase, y si está por debajo, se asigna a la otra clase.
+
+Para resolver SVM se necesita conocer el kernel y el parámetro de regularización, que es una cuota superior sobre las variables duales, en definitiva, un coste. Pasamos a construirun primer el modelo usando un kernel radial RBF.
+
+```{r}
+# Estandarizamos las variables numéricas "m2" y "rooms"
+mhp_train_svm <- mhp_train
+mhp_train_svm$m2 <- scale(mhp_train$m2)
+mhp_train_svm$rooms <- scale(mhp_train$rooms)
+
+mhp_test_svm <- mhp_test
+mhp_test_svm$m2 <- scale(mhp_test$m2)
+mhp_test_svm$rooms <- scale(mhp_test$rooms)
+
+# Entrenamos el modelo SVM  kernel con kernel radial
+
+modelo_svm <- svm(precio_bin ~ rooms + m2 + garage + elevator + tipo_casa + precio_distrito, data = mhp_train_svm, kernel = "radial", cost = 10, scale = TRUE)
+
+# Hacemos predicciones en el conjunto de prueba
+svm_predicciones <- predict(modelo_svm, mhp_test_svm[, c("rooms", "m2", "garage", "elevator", "tipo_casa", "precio_distrito")])
+
+
+# Calculamos la matriz de confusión y la precisión del modelo
+svm_matriz_confusion <- table(Prediccion = svm_predicciones, Real = mhp_test_svm$precio_bin)
+print(svm_matriz_confusion)
+precision <- sum(diag(svm_matriz_confusion)) / sum(svm_matriz_confusion)
+print(paste0("Precisión del modelo SVM: ", round(precision * 100, 2), "%"))
+```
+
+Esto significa que:
+
+-   1692 casas con precio alto fueron clasificadas correctamente como precio alto (verdaderos positivos).
+-   1817 casas con precio bajo fueron clasificadas correctamente como precio bajo (verdaderos negativos).
+-   241 casas con precio alto fueron clasificadas incorrectamente como precio bajo (falsos negativos).
+-   116 casas con precio bajo fueron clasificadas incorrectamente como precio alto (falsos positivos).
+
+La precisión del modelo es del 90.77%.
+
+<u>**Elección del Kernel**</u>
+
+La elección del kernel en un modelo SVM depende de la naturaleza y la distribución de los datos. No hay una regla única para seleccionar el kernel, pero aquí hay algunas pautas generales para ayudarte a tomar una decisión:
+
+-   Kernel lineal: Si tus datos son linealmente separables o la cantidad de atributos es alta en comparación con la cantidad de muestras, entonces un kernel lineal suele funcionar bien. Además, es computacionalmente más eficiente que otros kernels.
+
+-   Kernel polinomial: Si tus datos tienen una estructura que puede ser capturada por un polinomio de un grado específico, el kernel polinomial podría ser una buena opción. Sin embargo, a medida que aumenta el grado del polinomio, el riesgo de sobreajuste aumenta y la complejidad computacional puede crecer.
+
+-   Kernel radial (RBF): El kernel radial es una opción popular y versátil en muchos casos, especialmente cuando no se sabe de antemano si los datos son linealmente separables. Puede manejar datos no lineales y complejos. Sin embargo, encontrar los parámetros adecuados (costo y gamma) puede requerir una búsqueda en el espacio de parámetros y, en consecuencia, un mayor tiempo de cómputo.
+
+-   Kernel sigmoide: El kernel sigmoide es similar a una función de activación de una red neuronal y puede ser una opción si deseas un enfoque similar al de una red neuronal pero con un modelo SVM.
+
+Vamos a probar a representar los datos para ver si de alguna manera puede tomarse una mejor decisión sobre el Kernel a usar.
+
+```{r}
+mhp_train %>%
+  ggplot(aes(x = m2, y = rooms, color = as.factor(precio_bin))) +
+  geom_point() +
+  facet_grid(elevator ~ garage, labeller = labeller(
+    elevator = c('0' = 'Sin Elevador', '1' = 'Con Elevador'),
+    garage = c('0' = 'Sin Garaje', '1' = 'Con Garaje')
+  )) +
+  labs(title = "Diagrama de dispersión de m2 vs rooms, según garage y elevator",
+       x = "Metros cuadrados",
+       y = "Número de habitaciones",
+       color = "Precio bin") +
+  scale_color_manual(values = c("1" = "#0BB363", "0" = "#DC143C")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.title.position = "plot")
+```
+
+Probamos varios Kernels.
+
+Creamos una función entrenar_evaluar_svm() que entrenará y evaluará un modelo SVM utilizando el tipo de kernel especificado en el argumento kernel_type. Luego con lapply() se aplicará esta función a cada tipo de kernel en el vector kernels. La función presentará un matriz de confusión y la precisión para cada tipo de kernel.
+
+```{r}
+# Definir una función para entrenar y evaluar un modelo SVM con un tipo de kernel específico
+entrenar_evaluar_svm <- function(kernel_type) {
+  # Entrenamos el modelo SVM con el kernel especificado
+  modelo_svm <- svm(precio_bin ~ rooms + m2 + garage + elevator + tipo_casa + precio_distrito, data = mhp_train_svm, kernel = kernel_type, cost = 10, scale = TRUE)
+
+  # Hacemos predicciones en el conjunto de prueba
+  svm_predicciones <- predict(modelo_svm, mhp_test_svm[, c("rooms", "m2", "garage", "elevator", "tipo_casa", "precio_distrito")])
+
+  # Calculamos la matriz de confusión y la precisión del modelo
+  svm_matriz_confusion <- table(Prediccion = svm_predicciones, Real = mhp_test_svm$precio_bin)
+  precision <- sum(diag(svm_matriz_confusion)) / sum(svm_matriz_confusion)
+  
+  # Devolvemos una lista con la precisión y la matriz de confusión
+  return(list(precision = precision, matriz_confusion = svm_matriz_confusion))
+}
+
+# Probar diferentes tipos de kernel
+kernels <- c("linear", "polynomial", "radial", "sigmoid")
+resultados <- lapply(kernels, entrenar_evaluar_svm)
+
+# Imprimir los resultados
+for (i in 1:length(kernels)) {
+  cat(paste("Precisión del modelo SVM con kernel", kernels[i], ":", round(resultados[[i]]$precision * 100, 2), "%\n"))
+  print(resultados[[i]]$matriz_confusion)
+}
+```
+
+Se observa que el KERNEL RADIAL es el que mejor predice, ahora vamos a ajustar algunos parámetros del modelo utilizando la función tune para encontrar los mejores parámetros.
+
+```{r}
+# Entrenar un modelo SVM con diferentes parámetros
+modelo_svm_radial <- svm(precio_bin ~ rooms + m2 + garage + elevator + tipo_casa + precio_distrito, data = mhp_train_svm, kernel = "radial", cost = 10, scale = TRUE)
+
+# Utilizar la función tune() para encontrar los mejores parámetros
+tuned_parameters <- tune(svm, 
+                         precio_bin ~ rooms + m2 + garage + elevator + tipo_casa + precio_distrito,
+                         data = mhp_train_svm,
+                         kernel = "radial",
+                         ranges = list(cost = c(0.1, 1, 10, 100, 1000),
+                                       gamma = c(0.1, 0.5, 1, 2, 5)))
+
+# Entrenar un modelo SVM con los mejores parámetros encontrados
+best_model <- tuned_parameters$best.model
+
+# Hacer predicciones en el conjunto de prueba con el mejor modelo
+best_predictions <- predict(best_model, mhp_test_svm[, c("rooms", "m2", "garage", "elevator", "tipo_casa", "precio_distrito")])
+
+# Calcular la matriz de confusión y la precisión del mejor modelo
+best_matriz_confusion <- table(Prediccion = best_predictions, Real = mhp_test_svm$precio_bin)
+print(best_matriz_confusion)
+best_precision <- sum(diag(best_matriz_confusion)) / sum(best_matriz_confusion)
+print(paste0("Precisión del mejor modelo SVM: ", round(best_precision * 100, 2), "%"))
+```
+
+La precisión del modelo no mejora del 90.77% anterior y el coste computacional en la busqueda del mejor modelo es enorme.  Parece que los parámetros del modelo elegidos durante el proceso de afinación no han sido los correctos. La afinación e hiperparámetros implica buscar la mejor combinación de hiperparámetros dentro del rango de búsqueda que se proporciona. Si el rango de búsqueda no contiene la combinación óptima de hiperparámetros, el proceso de afinación podría terminar eligiendo una combinación subóptima que resulte en un rendimiento inferior.
+
+# Evaluación y comparación de modelos
+
+Evaluamos y comparamos los modelos que mayor porcentaje de predicción nos han proporcionado, Random Forest y SVM radial cost 10 (modelo inicial que nos daba un alto porcentaje de predicción y bajo coste computacional).
+
+## Random Forest
+
+### K-fold Cross Validation
+
+K-fold Cross Validation es un método de validación cruzada donde la idea principal es dividir el conjunto de datos en K subconjuntos más pequeños, llamados "folds", y utilizarlos para entrenar y probar el modelo de manera iterativa. Esto ayuda a evitar el sobreajuste y proporciona una estimación más precisa del rendimiento del modelo en datos no vistos.
+
+El proceso de K-fold Cross Validation es el siguiente:
+
+* Dividir el conjunto de datos en K subconjuntos (folds) de aproximadamente el mismo tamaño.
+  + Para cada fold:
+    - a. Utilizar K-1 folds para entrenar el modelo.
+    - b. Utilizar el fold restante como conjunto de prueba para evaluar el rendimiento del modelo.
+* Repetir el proceso K veces, asegurándose de que cada fold se utilice como conjunto de prueba exactamente una vez.
+* Calcular métricas de rendimiento, como precisión, error cuadrático medio, etc., para cada una de las K iteraciones y promediar los resultados para obtener una estimación más sólida del rendimiento del modelo.
+
+La ventaja principal de utilizar K-fold Cross Validation es que todos los datos se utilizan tanto para entrenamiento como para pruebas, lo que proporciona una mejor estimación del rendimiento del modelo. Además, al repetir el proceso K veces, se reduce la varianza en las métricas de rendimiento, lo que resulta en una evaluación más confiable del modelo.
+
+
+
+```{r}
+# Renombramos los niveles de la variable de respuesta en los conjuntos de datos de entrenamiento y prueba
+mhp_train_scaled$precio_bin <- as.factor(mhp_train_scaled$precio_bin)
+levels(mhp_train_scaled$precio_bin) <- c("Level0", "Level1")
+
+mhp_test_scaled$precio_bin <- as.factor(mhp_test_scaled$precio_bin)
+levels(mhp_test_scaled$precio_bin) <- c("Level0", "Level1")
+
+# Configuramos la validación cruzada K-fold (por ejemplo, K=10)
+k_folds <- 10
+folds <- createFolds(mhp_train_scaled$precio_bin, k = k_folds)
+
+# Ajustamos un modelo Random Forest usando validación cruzada K-fold con la librería caret
+control <- trainControl(method = "cv", number = k_folds, index = folds)
+K_F_modelo_rf <- train(x = mhp_train_scaled[, c(3, 4, 5, 6, 7, 10, 11)],
+                   y = mhp_train_scaled$precio_bin,
+                   method = "rf",
+                   ntree = 10,
+                   trControl = control)
+
+# Imprimimos el resultado del modelo
+print(K_F_modelo_rf)
+```
+
+Estos resultados muestran el rendimiento del modelo de Random Forest para diferentes valores del hiperparámetro **mtry** que es el número de predictores que se utilizan en cada árbol de decisión. Se han probado 3 valores diferentes: 2, 4 y 7. y para cada valor de mtry se muestran precisiones cercanas al 90% como en el modelo inicial. K-fold validation nos indica que el mayor accuracy se obtiene con tan solo dos predictores, no hay necesidad de más.
+
+### N-fold Cross Validation
+
+Es otra técnica de validación donde el conjunto de datos se divide en N subconjuntos y se entrena N veces utilizando cada vez un pliegue diferente como conjunto de validación, y los restantes N-1 pliegues como conjunto de entrenamiento.
+
+Al final del proceso, se obtienen N métricas de rendimiento, una por cada iteración. Estas métricas se promedian para obtener una estimación única del rendimiento del modelo. Esta estimación es más fiable que la que se obtiene utilizando únicamente un único conjunto de entrenamiento y validación, ya que reduce el riesgo de que el rendimiento del modelo se vea afectado por una división aleatoria específica del conjunto de datos.
+
+La validación cruzada de N pliegues ayuda a identificar si un modelo está sobreajustado (overfitting) o infraajustado (underfitting).
+
+```{r}
+# Configura el método de control de entrenamiento
+control <- trainControl(method = "cv",
+                        number = 5, # N-fold Cross Validation
+                        savePredictions = "final",
+                        classProbs = TRUE)
+
+# Entrena el modelo de Random Forest con N-fold Cross Validation
+N_F_modelo_rf <- train(x = mhp_train_scaled[, c(3, 4, 5, 6, 7, 10,11)],
+                   y = mhp_train_scaled$precio_bin,
+                   method = "rf",
+                   trControl = control,
+                   tuneGrid = data.frame(mtry = c(2, 4, 7)))
+
+# Muestra los resultados del modelo
+print(N_F_modelo_rf)
+```
+
+Para hacer N-fold Validation se entrenó un modelo de Random Forest utilizando validación cruzada de 5 pliegues, y se encontró que el valor óptimo de mtry para este conjunto de datos y clasificación es 2. El modelo alcanzó una exactitud promedio del 90.4% y un índice Kappa promedio de 0.809.
+
+## SVM
+
+Repetimos las validaciones para SVM.
+
+### K-fold Cross Validation
+
+```{r}
+# fórmula
+formula_svm <- precio_bin ~ rooms + m2 + garage + elevator + tipo_casa + precio_distrito
+
+# Configura los parámetros de entrenamiento
+control_svm <- trainControl(method = "cv", number = 10) # 10-fold Cross Validation
+
+# Entrena el modelo SVM con K-fold Cross Validation
+K_F_modelo_svm_cv <- train(formula_svm,
+                       data = mhp_train_svm,
+                       method = "svmRadial",
+                       trControl = control_svm,
+                       preProcess = c("center", "scale"),
+                       tuneGrid = data.frame(sigma = 0.1, C = 10))
+
+# Muestra los resultados
+print(K_F_modelo_svm_cv)
+```
+
+Le realizó la validación cruzada con 6 predictores y 10 pliegues alcanzándose una precisión del 90.43% y un Kappa del 80.86% mostrando una alta concordancia entre las predicciones y los valores reales ajustados por el azar.
+
+### N-fold Cross Validation
+
+```{r}
+# Cambia los niveles de la variable de clase 'precio_bin' a nombres válidos
+mhp_train_svm$precio_bin <- factor(mhp_train_svm$precio_bin, labels = c("Level0", "Level1"))
+
+# Definimos los controles de entrenamiento para la validación cruzada N-fold
+control <- trainControl(method = "cv", number = 5, savePredictions = "final", classProbs = TRUE)
+
+# Creamos el modelo SVM con validación cruzada N-fold
+N_F_modelo_svm_cv <- train(precio_bin ~ rooms + m2 + garage + elevator + tipo_casa + precio_distrito,
+                       data = mhp_train_svm,
+                       method = "svmRadial",
+                       trControl = control,
+                       preProcess = c("center", "scale"),
+                       tuneGrid = data.frame(sigma = 0.1, C = 10))
+
+# Mostramos los resultados del modelo SVM con validación cruzada N-fold
+print(N_F_modelo_svm_cv)
+```
+
+Se realizó la validación cruzada con 6 predictores y 10 pliegues alcanzándose una precisión del 90.29% y un Kappa del 80.57%. 
+
+# Elección del mejor punto de corte según la curva ROC
+
+Nos disponemos a calcular las curvas ROC para cada uno de los modelo y los visualizamos en un mismo plot para mejor comparabilidad.
+
+```{r}
+# GLM
+probs_glm <- predict(glm_mhp, test_glm, type = "response")
+
+# KNN
+probs_knn <- attr(prediccion_knn5_test, "prob")
+
+# Decisión Tree
+probs_dt <- predict(arbol, mhp_test, type = "prob")[, 2]
+
+# Random Forest
+probs_rf <- predict(classifier, mhp_test, type = "prob")[, 2]
+
+# SVM
+probs_svm <- predict(modelo_svm, mhp_test_svm[, c("rooms", "m2", "garage", "elevator", "tipo_casa", "precio_distrito")], probability = TRUE)
+probs_svm <- attr(probs_svm, "probabilities")[, 2]
+```
+
+```{r}
+# Calcula las curvas ROC
+roc_glm <- roc(mhp_test$precio_bin, probs_glm)
+roc_knn <- roc(mhp_test$precio_bin, probs_knn)
+roc_dt <- roc(mhp_test$precio_bin, probs_dt)
+roc_rf <- roc(mhp_test$precio_bin, probs_rf)
+#roc_svm <- roc(mhp_test$precio_bin, probs_svm)
+
+# Configura el gráfico
+plot(roc_glm, col = "blue", lwd = 2, legacy.axes = TRUE, main = "Curvas ROC")
+lines(roc_knn, col = "red", lwd = 2)
+lines(roc_dt, col = "green", lwd = 2)
+lines(roc_rf, col = "darkred", lwd = 2)
+#lines(roc_svm, col = "orange", lwd = 2)
+
+# Añade leyenda
+legend("bottomright", legend = c("GLM", "KNN", "Decisión Tree", "Random Forest", "SVM"),
+       col = c("blue", "red", "green", "darkred", "orange"), lwd = 2)
+```
+
+<u>**CONCLUSIONES**</u>
+
+Después de evaluar todos los modelos de aprendizaje automático, se observa que los mejores resultados se obtienen con el modelo de Random Forest y el modelo SVM (Support Vector Machine). Sin embargo, el modelo Random Forest es preferido sobre el modelo SVM por las siguientes razones:
+
+1. **Coste computacional:** El modelo Random Forest generalmente tiene un menor costo computacional en comparación con el modelo SVM, especialmente cuando se trabaja con grandes conjuntos de datos. Esto significa que el tiempo de entrenamiento y predicción es más corto y requiere menos recursos computacionales.
+
+2. **Simplicidad del modelo:** Aunque ambos modelos son eficaces, el modelo Random Forest es más fácil de entender y de explicar. Los árboles de decisión que forman el Random Forest pueden visualizarse y analizarse fácilmente, lo que facilita la interpretación de los resultados y la identificación de características importantes.
+
+3. **Explicabilidad:** La explicabilidad es un aspecto crítico en la ciencia de datos y el aprendizaje automático. Los modelos que son más fáciles de explicar y entender son preferibles en muchas situaciones, especialmente cuando se necesita justificar las decisiones basadas en estos modelos. El modelo Random Forest ofrece una mejor explicabilidad en comparación con el modelo SVM, ya que es más fácil de visualizar y entender cómo se toman las decisiones en el modelo.
+
+4. **Rendimiento similar:** A pesar de las ventajas mencionadas anteriormente, la elección entre Random Forest y SVM se basa en gran medida en su rendimiento en la tarea específica. En este caso, ambos modelos proporcionan resultados similares, lo que respalda la decisión de elegir el modelo Random Forest debido a sus otras ventajas.
+
+# Deep Learning
+
+El Deep Learning es una rama del aprendizaje automático (machine learning) que se enfoca en el entrenamiento de redes neuronales artificiales profundas para aprender y extraer patrones complejos a partir de datos. Estas redes neuronales se componen de múltiples capas de nodos interconectados, lo que les permite aprender representaciones de datos en diferentes niveles de abstracción.
+
+A diferencia de otros métodos de aprendizaje automático, el Deep Learning se caracteriza por su capacidad para aprender automáticamente características relevantes directamente de los datos, sin necesidad de que sean especificadas o extraídas manualmente. Esto lo logra mediante el proceso de entrenamiento, donde la red neuronal ajusta los pesos y los sesgos de sus conexiones para minimizar una función de pérdida y mejorar la capacidad de predicción o clasificación.
+
+El Deep Learning ha mostrado un gran éxito en una amplia variedad de tareas de aprendizaje automático, como reconocimiento de imágenes, procesamiento de lenguaje natural, reconocimiento de voz, traducción automática... Esto se debe a su capacidad para modelar relaciones y patrones complejos en los datos, así como a la disponibilidad de grandes conjuntos de datos y avances en hardware de computación como los GPUs que aceleran el entrenamiento de redes neuronales profundas.
+
+Algunas de las arquitecturas de redes neuronales profundas más utilizadas en Deep Learning incluyen las redes neuronales convolucionales (CNN) para el procesamiento de imágenes, redes neuronales recurrentes (RNN) para el procesamiento de secuencias y las redes neuronales generativas adversariales (GAN) para la generación de contenido nuevo.
+
+\
+
+Entonces... ¿Cómo funcionan?
+
+Se podría decir que funcionan como un cerebro humano, hay neuronas y cada una de ellas recibe diferentes señales de entrada (𝑥1, 𝑥2, ...) de fuentes externas o de otras neuronas.
+Cada señal de entrada se multiplica por un valor denominado peso que da una idea de la fuerza de dicha conexión (𝑤1, 𝑤2, ...).
+La fase de entrenamiento modifica los pesos, y la neurona calcula una salida, usando Σ y una función de activación 𝑓.
+
+Aplicado a nuestro dataset del mercado inmobiliario en Madrid, vamos a ir entrenando una red neuronal con distintas configuraciones de capas, neuronas y funciones de activación para ver si obtenemos un modelo realmente predictivo del precio de los inmuebles y por consiguiente generar una buena herramienta de clasificación de los mismos.
+
+Vamos a usar la libreria h2o. Para ello primero vemos un poco la estructura que tenemos en nuestro dataset para ver que variables hay que convertir.
+
+```{r}
+str(mhp_train_scaled)
+```
+```{r}
+levels(mhp_train_scaled$precio_bin) <- c(0, 1)
+
+levels(mhp_test_scaled$precio_bin) <- c(0, 1)
+```
+
+
+Una vez observamos las variables procedemos a convertir a variables numericas todas las que son factores 0,1. Las que son factores las convertimos tambíen en variables 1,2,3 y las hacemos numéricas y creamos el dataset que vamos a usar para este apartado.  
+
+```{r}
+library(h2o)
+variables_numericas <- c("elevator","garage","exterior")
+mhp_train_scaled[variables_numericas] <- lapply(mhp_train_scaled[variables_numericas], as.numeric)
+mhp_train_scaled$tipo_casa = as.numeric(factor(mhp_train_scaled$tipo_casa,
+                                               levels = c("casa","piso","sotano"),
+                                               labels = c(1,2,3)))
+mhp_train_scaled$precio_distrito = as.numeric(factor(mhp_train_scaled$precio_distrito,
+                                               levels = c("caro","medio","barato"),
+                                               labels = c(1,2,3)))
+RNA_train = mhp_train_scaled[,c(3,4,5,6,7,10,11,12)]
+```
+
+Inicializamos la libreria h2o y ponemos el valor = -1 para que use todos los cores disponibles y agilice el proceso.
+Creamos el clasificador usando de la libreria h20 el método deeplearning y le pasamos los parámetros que consideramos oportunos. Le pasamos la función de activacion "Rectifier". "Rectifier" toma el valor de entrada y si es positivo, lo deja igual. Si es negativo, lo convierte en cero. Es una función no lineal que introduce no linealidad en la red neuronal, lo que permite que la red pueda aprender relaciones más complejas entre las características y mejorar su capacidad de generalización.
+
+La función de activación Rectifier se utiliza comúnmente en capas ocultas de redes neuronales profundas debido a su eficiencia computacional y su capacidad para prevenir problemas de desvanecimiento de gradientes en comparación con funciones de activación como la sigmoide y la tangente hiperbólica.
+
+Le pasamos el parámetro hidden al cual le pasamos 2 capas ocultas cada una de ellas con 6 neuronas. 
+
+Con el parámetro epoch le decimos que repita el proceso 100 veces.
+
+El parámetro train_samples_per_iteration controla la cantidad de datos que se utilizarán en cada iteración del entrenamiento. Un valor negativo como -2 indica que H2O utilizará el conjunto completo de entrenamiento en cada iteración. Esto se conoce como "batch training", lo que significa que se utilizan todos los datos para actualizar los pesos de la red neuronal después de cada iteración.
+
+```{r}
+h2o.init(nthreads = -1)
+clasificador_RNA = h2o.deeplearning(y = "precio_bin",
+                                    training_frame = as.h2o(RNA_train),
+                                    activation = "Rectifier",
+                                    hidden = c(6,6),
+                                    epochs = 100,
+                                    train_samples_per_iteration = -2)
+```
+
+Procedemos a hacer lo mismo de antes pero con el conjunto de test.
+
+```{r}
+mhp_test_scaled[variables_numericas] <- lapply(mhp_test_scaled[variables_numericas], as.numeric)
+mhp_test_scaled$tipo_casa = as.numeric(factor(mhp_test_scaled$tipo_casa,
+                                               levels = c("casa","piso","sotano"),
+                                               labels = c(1,2,3)))
+mhp_test_scaled$precio_distrito = as.numeric(factor(mhp_test_scaled$precio_distrito,
+                                               levels = c("caro","medio","barato"),
+                                               labels = c(1,2,3)))
+RNA_test = mhp_test_scaled[,c(3,4,5,6,7,10,11,12)]
+```
+
+Creamos el predictor, al cual le pasamos el clasificador y el conjunto de test.
+Después lo convertimos a vector.
+
+```{r}
+RNA_predictor = h2o.predict(clasificador_RNA,
+                            newdata = as.h2o(RNA_test[,-8]))
+RNA_y_pred <- as.vector(ifelse(RNA_predictor$p1 > 0.5 , 1, 0))
+```
+
+```{r}
+# Convierte RNA_y_pred en un factor con los mismos niveles que RNA_test[["precio_bin"]]
+RNA_y_pred_factor <- factor(RNA_y_pred, levels = levels(RNA_test[["precio_bin"]]))
+
+# Creamos la matriz de confusión
+RNA_cm <- confusionMatrix(RNA_y_pred_factor, RNA_test[["precio_bin"]])
+```
+
+Observamos a continuación los resultados de la matriz de confusión. Tenemos un accuracy muy alto del 0,906 lo cual supera a nuestros modelos de "Machine Learning" aunque por un par de centésimas.
+
+```{r}
+RNA_cm
+```
+
+
+
+
+# Explicabilidad
+
+¿Utilizarías ciegamente un modelo de aprendizaje automático para tomar una decisión de la que dependiese tu vida? Ten en cuenta lo siguiente...
+
+-   ¿Tienes acceso al modelo?
+-   Tienes acceso al modelo pero... ¿Puedes entender sus predicciones?
+-   ¿Que hace que unas predicciones caigan de un lado y otras de otro?
+
+... y si hubieseis diseñado vosotros el modelo? ¿Lo utilizaríais? ¿Dejaríais que lo utilizasen otros?
+
+En este apartado nos disponemos a dotar de sentido a los modelos desarrollados previamente para entenderlos y proporcionar confianza en su uso. Para ello exiten varias técnicas de explicabilidad como:
+
+-   Técnicas de descripción de la importancia de las características: valores **SHAP**
+-   Modelos sustitutos: **LIME** y **ANCHOR**
+-   Modelos **Contrafácticos**
+
+Veamos alguno de ellos...
+
+## SHAP
+
+SHAP (SHapley Additive exPlanations) es una técnica de explicabilidad en el ámbito del aprendizaje automático que proporciona una forma de explicar el resultado de un modelo al asignar valores a cada característica (atributo / variable) que contribuye al resultado de una predicción. La idea principal detrás de SHAP es utilizar la teoría de juegos para asignar una "importancia" a cada característica considerando todas las combinaciones posibles de características.
+
+El enfoque de SHAP se basa en los valores Shapley, que son una medida utilizada en la teoría de juegos para asignar una contribución justa a cada característica en una coalición de características. 
+
+### Preparación de los datos
+
+```{r}
+mhp_xgboost <- read_csv("house_price_madrid_14_08_2022.csv")
+
+mhp_xgboost$rooms[mhp_xgboost$rooms > 40] <- NA # Quito una casa con 40 habitaciones, es un error
+mhp_xgboost$m2[mhp_xgboost$m2 < 3] <- NA # Quito una casa con 3m cuadrados, es un error
+mhp_xgboost$price[mhp_xgboost$price < 1000] <- NA # Quito una casa que solo vale 1.000 €, es un error
+mhp_xgboost <- na.omit(mhp_xgboost) # Quito NA's
+
+mhp_xgboost <- mhp_xgboost[, !(names(mhp_xgboost) %in% c("house_type","neighborhood", "district"))] # Quito variables que no me aportan nada
+
+mhp_xgboost <- mhp_xgboost %>% rename(exterior = house_type_2) # Cambio de nombre la variable "house_type_2"
+
+mhp_xgboost$exterior = ifelse(mhp_xgboost$exterior == "exterior", 1, 0)  # Binarizo la nueva variable "exterior" antes conocida como "variable house_type_2"
+
+mhp_xgboost$exterior <- as.numeric(mhp_xgboost$exterior)
+
+
+mhp_xgboost$elevator = ifelse(mhp_xgboost$elevator == "TRUE", 1, 0) # Binarizo la nueva variable "elevator"
+mhp_xgboost$elevator = as.numeric(mhp_xgboost$elevator)
+
+mhp_xgboost$garage = ifelse(mhp_xgboost$garage == "TRUE", 1, 0)  # Binarizo la nueva variable "garage"
+mhp_xgboost$garage = as.numeric(mhp_xgboost$garage)
+
+# Creamos variable target precio binario y en base a la mediana asignamos casas tipo "cara" o "barata"
+mhp_xgboost$precio_binario <- ifelse(mhp_xgboost$price > median(mhp_xgboost$price), "cara", "barata")
+mhp_xgboost$precio_binario = ifelse(mhp_xgboost$precio_binario == "cara", 1, 0)
+mhp_xgboost$precio_binario = as.numeric(mhp_xgboost$precio_binario)
+
+dim(mhp_xgboost)
+str(mhp_xgboost)
+summary(mhp_xgboost)
+```
+
+### División train / test
+
+```{r}
+# Definir la proporción de datos que deseas para el conjunto de prueba (test)
+proporcion_test <- 0.3  # Por ejemplo, 30% para test
+
+# Obtener el índice de las filas que serán asignadas al conjunto de prueba
+set.seed(42)  # Fijar semilla para reproducibilidad
+indice_test <- createDataPartition(mhp_xgboost$price, p = proporcion_test, list = FALSE)
+
+# Crear los conjuntos de entrenamiento y prueba
+mhp_xgboost_train <- mhp_xgboost[-indice_test, ]
+mhp_xgboost_test <- mhp_xgboost[indice_test, ]
+```
+
+```{r}
+summary(mhp_xgboost_train)
+nrow(mhp_xgboost_train)
+summary(mhp_xgboost_test)
+nrow(mhp_xgboost_test)
+nrow(mhp_xgboost)
+```
+
+### XGBOOST
+
+```{r}
+# DATOS PARA TRAIN XGBOOST
+# Definir las variables predictoras y la variable objetivo
+X_train <- mhp_xgboost_train[, c("exterior", "rooms", "m2", "elevator", "garage")]
+y_train <- mhp_xgboost_train$precio_binario
+
+# Convertir las variables predictoras a matriz DMatrix (formato requerido por XGBoost)
+dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+
+
+# DATOS PARA TEST XGBOOST
+# Extraer las variables predictoras del conjunto de prueba
+X_test <- mhp_xgboost_test[, c("exterior", "rooms", "m2", "elevator", "garage")]
+y_test <- mhp_xgboost_test$precio_binario
+
+# Convertir las variables predictoras a matriz DMatrix (formato requerido por XGBoost)
+dtest <- xgb.DMatrix(data = as.matrix(X_test), label = y_test)
+```
+
+```{r}
+# MODELO XGBOOST
+set.seed(1234)
+model_xgboost = xgboost::xgboost(
+  data = dtrain,
+  nrounds = 10, objective = "binary:logistic")
+summary(model_xgboost)
+```
+
+```{r}
+# Obtenemos predicciones de la red neuronal sobre los datos tests
+preds=predict(model_xgboost, dtest)
+
+# Establecemos el umbral 0.8
+preds_class = as.numeric(preds > 0.80)
+```
+
+Ahora pasamos a la Explicabilidad de la técnicas SHAP.
+
+```{r}
+## Grafico para los SHAP values de todos los datos 
+ # Obtenemos los valores SHAP
+shap_values = shap.values(xgb_model = model_xgboost, X_train = as.matrix(X_train)) # podemos obtenerlo en train
+shap_values = shap.values(xgb_model = model_xgboost, X_train = as.matrix(X_test)) # o en test
+
+shap_values_datos = shap_values$shap_score
+ # Los ponemos en el formato correcto
+shap_long_datos = shap.prep(xgb_model = model_xgboost, X_train = as.matrix(X_train))
+ # Grafico
+shap.plot.summary(shap_long_datos, scientific = F)
+
+
+## Grafico de importancia de las variables mediante SHAP
+ # Obtenemos valores medios SHAP por variable
+shap_values_variable=shap_values$mean_shap_score
+ # Lo dibujamos con ploylt
+m = list(
+  l = 50,
+  r = 50,
+  b = 100,
+  t = 100,
+  pad = 4
+)
+nombre_variables = names(shap_values_variable)
+data_plot = data.frame(nombre_variables, shap_values_variable, stringsAsFactors = FALSE)
+data_plot$nombre_variables = factor(data_plot$nombre_variables, levels = unique(data_plot$nombre_variables)[order(data_plot$shap_values_variable, decreasing = FALSE)])
+
+fig_importancia_vbles = plot_ly(data_plot, x = ~shap_values_variable, y = ~nombre_variables,
+               type = 'bar',
+               marker = list(color = 'rgb(110, 36, 157)'), orientation = 'h')
+fig_importancia_vbles = fig_importancia_vbles %>% layout(title = "Importancia de las variables",
+                      xaxis = list(title = "Media de los valores Shap"),
+                      yaxis = list(title = " "),
+                      autosize = F, width = 650, height = 550, margin = m)
+fig_importancia_vbles
+```
+
+
+\
+
+-   Valores altos de **m2** aumentan la probabilidad de que el sea cara, mientras que los valores bajos disminuyen la probabilidad de que sea una casa cara.
+-   Que tenga **ascensor** afecta al incremento del precio de la vivienda pero no es muy relevante.
+-   El número de **habitaciones** afecta al precio, sobretodo negativamente en vivienda con menor número.
+-   Que sea **exterior** hace que la casa aumente su valor pero que sea interior hace que disminuya como se aprecia en  la region morada del gráfico .
+-   Que tenga **garage** o no realmente no afecta en gran medida al contribuir a que la casa sea cara.
+
+\
+
+-   La variable más importante del modelo con diferencia es **m2**, el número de metros cuadrados que tiene la vivienda.
+-   El número de **habitaciones** y el **ascensor** influyen levemente en el modelo.
+-   Las variables más redundantes son **exterior** y **garage**.
+
+
+
+# Series Temporales
+
+\
+
+![](Walmart.jpg)
+
+\
+
+Continuando con nuestro proyecto de Machine Learning pero apartándonos bastante del dataset original basado en la predicción del precio y etiquetado de casas en Madrid, procedemos a hacer un estudio de ventas en un famoso centro comercial estadounidense, <u>**Walmart**</u>. 
+
+Para ello hemos obtenido un dataset bastante completo con información de ventas de dicho establecimiento de un repositorio en la siguiente web ([kaggle - Walmart Sales Dataset of 45 Stores](https://www.kaggle.com/datasets/varsharam/walmart-sales-dataset-of-45stores?select=walmart-sales-dataset-of-45stores.csv)) con formato _long format_.
+
+Para el análisis de series temporales conviene saber que son un conjuntos de datos secuenciales que representan observaciones realizadas a lo largo del tiempo, generalmente en intervalos regulares. En este tipo de datos, el orden temporal es fundamental, ya que cada observación está asociada a un momento específico en el tiempo.
+
+El análisis de series temporales se enfoca en comprender y modelar el patrón temporal subyacente en los datos, con el objetivo de predecir o explicar su comportamiento futuro. Las series temporales pueden presentar diferentes características, como tendencias, estacionalidad, ciclos y componentes aleatorios.
+
+Al analizar una serie temporal, se busca identificar patrones y estructuras temporales, como cambios de tendencia, patrones estacionales o efectos de eventos específicos. Esto se logra mediante técnicas estadísticas y modelos matemáticos que permiten modelar y predecir el comportamiento futuro de la serie.
+
+Las series temporales pueden utilizarse en una amplia gama de aplicaciones, como pronósticos económicos, análisis de ventas, previsión del clima, análisis de datos financieros...
+
+En el contexto de nuestro proyecto con el dataset de ventas de Waltmark, nos disponemos a utilizar técnicas de análisis de series temporales para estudiar el comportamiento de las ventas a lo largo del tiempo, identificar patrones estacionales, detectar cambios en las tendencias, analizar el impacto de eventos especiales y realizar pronósticos de las ventas futuras.
+
+## Lectura y preparación de los datos 
+
+```{r}
+walmart <- read_csv("walmart.csv")
+```
+
+```{r}
+head(walmart, 10) %>%
+  kbl() %>%
+  kable_material(c("striped", "hover")) %>%
+  scroll_box(width = "100%", height = "350px")
+```
+
+```{r}
+walmart$Store <- factor(walmart$Store)
+walmart$Date <- as.Date(walmart$Date, format = "%d-%m-%Y")
+walmart$Holiday_Flag <- as.factor(walmart$Holiday_Flag)
+```
+
+```{r}
+summary(walmart)
+```
+
+```{r}
+str(walmart) 
+```
+
+El dataset contiene **6.435 observaciones** correspondientes a ventas semanales en cada una de las 45 tiendas Walmart en EEUU entre 2010 y 2012 además de **8 variables** (de las cuales son **2 cualitativas** y **6 cuantitativas**).
+
+A continuación, la descripción de cada una de las variables:
+
+  - **Store**: Número de tienda que van del 1 al 45
+  
+  - **Date**: Día de la semana donde se recoge el dato de ventas. Tiene formato dd-mm-yyyy. Comienza 05-02-2010 hasta 26-10-2012; un total de 143 semanas (2 años y 9 meses)
+  
+  - **Weekly_Sales**: Ventas totales durante la semana
+  
+  - **Holiday_Flag**: Si la semana tiene un feriado especial o no. 1 si la semana tiene un feriado 0 si la semana es completamente laboral
+  
+  - **Temperature**: Temperatura media de la semana donde se producen las ventas
+  
+  - **Fuel_Price**: Precio del combustible en la región donde se encuentra situada la tienda
+  
+  - **CPI**: Índice de precios del cliente. Es un indicador utilizado para medir los cambios en el nivel de precios de bienes y servicios a lo largo del tiempo. El CPI es calculado por la Oficina de Estadísticas Laborales (Bureau of Labor Statistics) y es ampliamente utilizado como una medida de la inflación en la economía. Se basa en una "cesta de bienes" que representa los productos y servicios típicos que consume un hogar promedio. Es lo mismo que el IPC (Índice de Precio al Consumo).
+  
+  - **Unemployment**: Tasa de desempleo en la región donde se encuentra situada la tienda
+
+## Análisis y gráficos univariante
+
+Comenzamos con unas tablas y gráficos simples por variable para ver como se comportan los datos y analizar los estadísticos principales por tienda.
+
+```{r}
+# Función para formatear números como moneda en formato americano
+formatCurrency <- function(x) {
+  format(x, big.mark = ".", decimal.mark = ",", nsmall = 2, trim = TRUE, scientific = FALSE)
+}
+
+# Calcular estadísticas de Walmart para la variable Temperature
+walmart_stats_temperature <- walmart %>%
+  group_by(Store) %>%
+  summarise(min = formatCurrency(round(min(Temperature),2)),
+            max = formatCurrency(round(max(Temperature),2)),
+            median = formatCurrency(round(median(Temperature),2)),
+            mean = formatCurrency(round(mean(Temperature),2)),
+            sd = formatCurrency(round(sd(Temperature),2)))
+            
+# Calcular estadísticas de Walmart para la variable Fuel_Price
+walmart_stats_fuel <- walmart %>%
+  group_by(Store) %>%
+  summarise(min = formatCurrency(round(min(Fuel_Price),2)),
+            max = formatCurrency(round(max(Fuel_Price),2)),
+            median = formatCurrency(round(median(Fuel_Price),2)),
+            mean = formatCurrency(round(mean(Fuel_Price),2)),
+            sd = formatCurrency(round(sd(Fuel_Price),2)))
+
+# Calcular estadísticas de Walmart para la variable CPI
+walmart_stats_cpi <- walmart %>%
+  group_by(Store) %>%
+  summarise(min = formatCurrency(round(min(CPI),2)),
+            max = formatCurrency(round(max(CPI),2)),
+            median = formatCurrency(round(median(CPI),2)),
+            mean = formatCurrency(round(mean(CPI),2)),
+            sd = formatCurrency(round(sd(CPI),2)))
+
+# Calcular estadísticas de Walmart para la variable Unemployment
+walmart_stats_unemployment <- walmart %>%
+  group_by(Store) %>%
+  summarise(min = formatCurrency(round(min(Unemployment),2)),
+            max = formatCurrency(round(max(Unemployment),2)),
+            median = formatCurrency(round(median(Unemployment),2)),
+            mean = formatCurrency(round(mean(Unemployment),2)),
+            sd = formatCurrency(round(sd(Unemployment),2)))
+
+# Mostrar la tabla con los resultados para la variable Temperature
+datatable(walmart_stats_temperature, options = list(scrollY = "300px", paging = FALSE), caption = "TEMPERATURE")
+
+# Mostrar la tabla con los resultados para la variable Fuel_Price
+datatable(walmart_stats_fuel, options = list(scrollY = "300px", paging = FALSE), caption = "FUEL PRICE")
+
+# Mostrar la tabla con los resultados para la variable CPI
+datatable(walmart_stats_cpi, options = list(scrollY = "300px", paging = FALSE), caption = "CPI")
+
+# Mostrar la tabla con los resultados para la variable Unemployment
+datatable(walmart_stats_unemployment, options = list(scrollY = "300px", paging = FALSE), caption = "UNEMPLOYMENT")
+```
+
+```{r}
+plot1 <- ggplot(walmart, aes(x = "", y = Temperature)) +
+  geom_boxplot(fill = "#FFB21C") +
+  labs(x = "ºF", y = "Temperature") +
+  theme_minimal()
+
+plot2 <- ggplot(walmart, aes(x = "", y = Fuel_Price)) +
+  geom_boxplot(fill = "#FFB21C") +
+  labs(x = "$ Gallon", y = "Fuel Price") +
+  theme_minimal()
+
+plot3 <- ggplot(walmart, aes(x = "", y = CPI)) +
+  geom_boxplot(fill = "#FFB21C") +
+  labs(x = "Index", y = "CPI") +
+  theme_minimal()
+
+plot4 <- ggplot(walmart, aes(x = "", y = Unemployment)) +
+  geom_boxplot(fill = "#FFB21C") +
+  labs(x = "Rate", y = "Unemployment") +
+  theme_minimal()
+
+grid <- grid.arrange(plot1, plot2, plot3, plot4, nrow = 2, ncol = 2)
+```
+
+Nos llama la atención la amplitud de las variables **CPI** y **Unemployment** y pasamos a graficarlas por tienda. 
+
+```{r}
+plot5 <- ggplot(walmart, aes(x = as.factor(Store), y = CPI, fill = as.factor(Store))) +
+  geom_boxplot(fill = "#FFB21C") +
+  labs(x = "Store", y = "CPI", title = "CPI per Store's Region") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  coord_flip()
+
+plot6 <- ggplot(walmart, aes(x = as.factor(Store), y = Unemployment, fill = as.factor(Store))) +
+  geom_boxplot(fill = "#FFB21C") +
+  labs(x = "Store", y = "Unemployment", title = "Unemployment Rate per Store's Region") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  coord_flip()
+
+plot5
+plot6
+```
+
+Parece que dependiendo de la región donde se encuentre la tienda hay una mayor dispersión del gasto promedio en una cesta de la compra; y la tasa de desempleo también contribuye de manera relevante acentuándo dicha dispersión.
+El inconveniente es que a través del dataset desconocemos las regiones de EEUU donde se sitúan las 45 tiendas Walmart por lo que no podemos interpretar si tiene o no demasiado sentido, vamos a suponer que sí ya que no es lo mismo una tienda situada en un estado con mayor población que otro, y no es lo mismo una tienda en los estados rurales que en las grandes urbes de ambas costas.
+
+Ahora nos disponemoa a analizar las ventas semanales usando la variable **Weekly_Sales**.
+
+```{r}
+# Función para formatear números como moneda en formato americano
+formatCurrency <- function(x) {
+  format(x, big.mark = ".", decimal.mark = ",", nsmall = 2, trim = TRUE, scientific = FALSE)
+}
+
+# Calcular estadísticas de Walmart
+walmart_stats <- walmart %>%
+  group_by(Store) %>%
+  summarise(min = formatCurrency(round(min(Weekly_Sales),2)),
+            max = formatCurrency(round(max(Weekly_Sales),2)),
+            median = formatCurrency(round(median(Weekly_Sales),2)),
+            mean = formatCurrency(round(mean(Weekly_Sales),2)),
+            sd = formatCurrency(round(sd(Weekly_Sales),2)),
+            sum = formatCurrency(round(sum(Weekly_Sales),2)))
+
+# Mostrar la tabla con los resultados
+datatable(walmart_stats, options = list(scrollY = "300px", paging = FALSE), caption = "SALES")
+```
+
+```{r}
+# Suma de las ventas semanales por tienda
+ventas_por_tienda <- aggregate(Weekly_Sales ~ Store, data = walmart, FUN = sum)
+
+# Orden de las tiendas de menor a mayor ventas
+ventas_por_tienda <- ventas_por_tienda[order(ventas_por_tienda$Weekly_Sales, decreasing = FALSE), ]
+ventas_por_tienda$Store <- factor(ventas_por_tienda$Store, levels = ventas_por_tienda$Store)
+
+plot7 <- ggplot(ventas_por_tienda, aes(x = Weekly_Sales, y = Store)) +
+  geom_bar(stat = "identity", fill = "#FFB21C") +
+  labs(x = "Total Sales (Millions)", y = "Store", title = "Total Sales per Store Aggregated by Sum") +
+  scale_y_discrete(labels = ventas_por_tienda$Store) +
+  scale_x_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plot7
+```
+
+```{r}
+plot8 <- ggplot(walmart, aes(x = as.factor(Store), y = Weekly_Sales, fill = as.factor(Store))) +
+  geom_boxplot(fill = "#FFB21C") +
+  labs(x = "Store", y = "Weekly Sales", title = "Weekly Sales per Store") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  coord_flip() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6))
+
+plot8
+```
+
+Este boxplot tampoco es muy exclarecedor, en muchas tiendas exite gran dispersión de los datos dentro del rango intercuartílico y hay datos muy atípicos. Esto puede sugerir que la distribución de datos está sesgada. Insistimos en que sin conocer las regiones donde se encuentran las tiendas es muy complicado llegar a más conclusiones o a un mejor entendimiento.
+
+## Análisis y gráficos multivariante
+
+Una vez analizadas todas las variables de forma individual, podemos buscar algunas relaciones entre ellas mediante el siguiente análisis multivariante donde se pueden observar que existen correlaciones muy débiles, sólo pudiendo destacarse la correlación negativa del -0.3 que existe entre el CPI y la tasa de Unemployment; correlación que tiene bastante lógica dado que a mayor tasa de desempleo el gasto promedio en una cesta de la compra se verá redicido.
+Otro correlación muy débil aunque reseñable es la de 0.18 que existe entre la temperatura y el CPI, quizas a mayor temperatura la población salga más a la calle a consumir... pero es dificilmente demostrable.
+
+```{r}
+variables <- c("Weekly_Sales", "Temperature", "Fuel_Price", "CPI", "Unemployment")
+data <- walmart[, variables]
+correlation_matrix <- cor(data)
+plot9 <- ggcorrplot(correlation_matrix, type = "lower", lab = TRUE, lab_size = 3)
+
+plot9
+```
+
+## Análisis y gráficos de series temporales
+
+Antes de graficar las series temporales de nuestro dataset vamos a sacar por tienda las 3 mayores ventas y el restos de las variables asociadas a las mismas para tratar de identificar si hay algún patrón como que todas se producen en las mismas fechas, que todas tienen unos índeces CPI concretos o que están sujetas a unas tasas de desempleo específicas...
+
+```{r}
+# Función para formatear números como moneda en formato americano
+formatCurrency <- function(x) {
+  format(x, big.mark = ".", decimal.mark = ",", nsmall = 2, trim = TRUE, scientific = FALSE)
+}
+
+# Calcular las 5 mayores cifras de ventas para cada tienda
+walmart_top5sales <- walmart %>%
+  group_by(Store) %>%
+  top_n(3, Weekly_Sales) %>%
+  summarise(Max_Weekly_Sales = formatCurrency(Weekly_Sales),
+            Date = Date,
+            Fuel_Price = formatCurrency(round(Fuel_Price,2)),
+            CPI = formatCurrency(round(CPI,2)),
+            Unemployment = formatCurrency(round(Unemployment,2)))
+
+# Mostrar la tabla con los resultados
+datatable(walmart_top5sales, options = list(scrollY = "300px", paging = FALSE), caption = "TOP 3 WEEKLY SALES PER STORE")
+```
+
+Ahora sacamos las 10 mayores ventas del dataset.
+
+```{r}
+# Función para formatear números como moneda en formato americano
+formatCurrency <- function(x) {
+  format(x, big.mark = ".", decimal.mark = ",", nsmall = 2, trim = TRUE, scientific = FALSE)
+}
+
+# Obtener los 10 primeros días con más ventas y aplicar el formato de moneda
+top_10_days <- walmart %>%
+  group_by(Date) %>%
+  summarise(total_sales = sum(Weekly_Sales)) %>%
+  top_n(10, total_sales) %>%
+  arrange(desc(total_sales)) %>%
+  mutate(total_sales = formatCurrency(total_sales))
+
+datatable(top_10_days, options = list(scrollY = "300px", paging = FALSE), caption = "TOP 10 DAYS WITH HIGHEST SALES")
+```
+
+Se observa claramente como en ambas tablas las semanas de Navidad y Acción de Gracias en noviembre tienen el record de ventas todos los años.
+
+\
+
+<u>**GRÁFICO SERIE TEMPORAL**</u>
+
+Comenzamos realizando con unos gráficos de líneas temporales en las variables más relevantes que deseamos analizar.
+
+```{r}
+walmart <- arrange(walmart, Date)
+
+plot10 <- ggplot(walmart, aes(x = Date, y = Weekly_Sales)) +
+  geom_line() +
+  labs(x = "Date", y = "Weekly Sales", title = "Weekly Sales Time Series Plot") +
+  scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6)) + 
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plot10
+```
+
+```{r}
+plot11 <- ggplot(walmart, aes(x = Date, y = Temperature)) +
+  geom_line() +
+  labs(x = "Date", y = "Temperature", title = "Temperature Time Series Plot") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme_minimal()
+
+plot12 <- ggplot(walmart, aes(x = Date, y = Fuel_Price)) +
+  geom_line() +
+  labs(x = "Date", y = "Fuel Price", title = "Fuel Price Time Series Plot") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme_minimal()
+
+plot13 <- ggplot(walmart, aes(x = Date, y = CPI)) +
+  geom_line() +
+  labs(x = "Date", y = "CPI", title = "CPI Time Series Plot") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme_minimal()
+
+plot14 <- ggplot(walmart, aes(x = Date, y = Unemployment)) +
+  geom_line() +
+  labs(x = "Date", y = "Unemployment", title = "Unemployment Time Series Plot") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme_minimal()
+
+grid <- grid.arrange(plot11, plot12, plot13, plot14, nrow = 2, ncol = 2)
+```
+
+El gráfico de la **temperatura** muestra un comportamiento totalmente normal donde se pueden identificar a simple vista las estaciones y sus variaciones de temperatura entre invierno y verano.
+
+El gráfico del **precio del combustible** muestra una relativa estabilidad en precios sufriendo una subida a partir del primer trimestre del 2010 teniendo su punto más álgido en el segundo trimestre del año; punto a partir del cual vuelve a bajar situándose cerca de los 2,5 dólares por galón en el tercer trimestre del año. No es así en el cuarto trimestre donde se origina una vertiginosa subida del precio por galón hasta el segundo trimestre del 2011, pasando de 2,5 a 4 dólares. 
+Desde este punto hasta el final del año se produce otra severa caída de precios cerrando el año 2011 alrededor de los 3,25 dólares.
+Durante el año 2012 se van produciendo unas subidas y bajadas de precios con bastante apuntamiento entre los 3,25 y 4 dólares.
+
+El gráfico del **CPI** muestra un comportamiento monótono creciente pero de manera apaisada que nos indica que el gasto medio en la lista de la compra va aumentando lentamente de manera progresiva. No obstante el gráfico muestra gran varianza en este índice debido precisamente a lo ya comentado con anteriorida; hay tiendas Walmart situadas en regiones de EEUU donde índice de población y el poder adquisitivo es menor y otras donde es mayor, diferencias entre estados rurales y grandes urbes.
+
+El gráfico de la tasa **Unemployment** parece que se muestra estable a lo largo del 2010 y 2011 hasta comenzar 2012 donde generalmente se va produciendo una caída en las tasas de desempleo.
+
+### Estacionariedad
+
+Antes de analizar la serie mediante test estadísticos, analicemos gráficamente más en detalle, para confirmar la estacionalidad detectada.
+Dadas las características de la serie realizamos una ***descomposición STL*** para corroborar que existe tendencia y estacionalidad.
+
+\
+
+*La descomposición STL (Seasonal and Trend decomposition using Loess) es un método utilizado para descomponer una serie temporal en sus componentes de tendencia, estacionalidad y residuos. Utiliza un enfoque no paramétrico basado en el ajuste de suavizadores locales (Loess) para estimar la tendencia y la estacionalidad de la serie temporal. La tendencia representa el patrón general y de largo plazo en los datos, mientras que la estacionalidad captura los patrones recurrentes y periódicos. Los residuos son la parte de la serie temporal que no puede ser explicada por la tendencia y la estacionalidad.*
+
+```{r}
+# Convertir el dataset a un tsibble
+walmart_tsibble <- as_tsibble(walmart, key = Store, index = Date)
+```
+
+```{r}
+walmart_tsibble_train <- walmart_tsibble %>% filter_index(. ~ "2012-06-29")
+walmart_tsibble_test <- walmart_tsibble %>% filter_index("2012-07-06" ~ .)
+```
+
+```{r}
+walmart_tsibble_train %>%
+  model(seats = feasts:::STL(Weekly_Sales)) %>%
+  components() %>%
+  autoplot() +
+  theme(legend.position = "none") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6)) +
+  theme(panel.grid.major = element_line(color = "grey"),
+        panel.grid.minor = element_line(color = "grey"),
+        panel.border = element_rect(color = "grey", fill = NA))
+```
+
+Se confirman visualmente las estacionalidades supuestas. Realizamos el mismo proceso con el resto de variables del dataset.
+
+```{r}
+walmart_tsibble_train %>%
+  model(seats = feasts:::STL(Fuel_Price)) %>%
+  components() %>%
+  autoplot() +
+  theme(legend.position = "none") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(panel.grid.major = element_line(color = "grey"),
+        panel.grid.minor = element_line(color = "grey"),
+        panel.border = element_rect(color = "grey", fill = NA))
+```
+
+De manera general existe una tendencia alcista en el precio del fuel con clara estacionariaded durante la primera mitad del año.
+
+```{r}
+walmart_tsibble_train %>%
+  model(seats = feasts:::STL(CPI)) %>%
+  components() %>%
+  autoplot() +
+  theme(legend.position = "none") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(panel.grid.major = element_line(color = "grey"),
+        panel.grid.minor = element_line(color = "grey"),
+        panel.border = element_rect(color = "grey", fill = NA))
+```
+
+Leve tendencia alcista en el caso del índice CPI. También existe estacionariaded durante la primera mitad del año.
+
+```{r}
+walmart_tsibble_train %>%
+  model(seats = feasts:::STL(Unemployment)) %>%
+  components() %>%
+  autoplot() +
+  theme(legend.position = "none") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(panel.grid.major = element_line(color = "grey"),
+        panel.grid.minor = element_line(color = "grey"),
+        panel.border = element_rect(color = "grey", fill = NA))
+```
+
+Por el contrario para la tasa de desempleo la tendencia es bajista. No se observa una clara estacionariedad.
+
+## Modelos de series temporales
+
+Tras esta descomposión por variable y teniendo en cuenta todo el dataset y toda la serie temporal para cada una de las tiendas, nos disponemos a la realización de modelos específicos pero sólo para la variable **Weekly_Sales** en agregado en lugar de para cada tienda.
+
+```{r}
+walmart_tsibble_train_agg <- as_tsibble(aggregate(Weekly_Sales ~ Date, data = walmart_tsibble_train, FUN = sum))
+walmart_tsibble_test_agg <- as_tsibble(aggregate(Weekly_Sales ~ Date, data = walmart_tsibble_test, FUN = sum))
+```
+
+```{r}
+plot15 <- ggplot(data = walmart_tsibble_train_agg, aes(x = Date, y = Weekly_Sales)) +
+    geom_line() +
+    labs(x = "Date", y = "Weekly Sales", title = "Aggregated Weekly Sales Time Series Plot") +
+    scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6)) + 
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+
+plot15
+```
+
+```{r}
+walmart_tsibble_train_agg %>%
+  model(seats = STL(Weekly_Sales)) %>%
+  components() %>%
+  autoplot() +
+  theme(legend.position = "none") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6)) +
+  theme(panel.grid.major = element_line(color = "grey"),
+        panel.grid.minor = element_line(color = "grey"),
+        panel.border = element_rect(color = "grey", fill = NA))
+```
+
+Las descomposiciones STL son la base de varias características. Una descomposición en serie temporal puede utilizarse para medir la fuerza de la tendencia y la estacionalidad en una serie temporal.
+
+En el caso de los datos de tendencias fuertes, los datos ajustados estacionalmente deberían tener mucha más variación que el componente restante.
+
+Una serie con fuerza estacional cerca de 0 no muestra casi ninguna estacionalidad, mientras que una serie con una fuerte estacionalidad cercana a 1.
+
+Otras características útiles basadas en la STL incluyen la cronología de los picos y los valles,  qué mes o trimestre contiene el mayor componente estacional y cuál contiene el menor componente estacional. Esto nos dice algo sobre la naturaleza de la estacionalidad.
+
+<u>**Estacionariedad en MEDIA**</u>
+
+Una forma de determinar más objetivamente si es necesario diferenciar es utilizar una prueba de raíces unitarias. Se trata de contrastes de hipótesis estadísticos de estacionariedad que están diseñados para determinar si se requiere una diferenciación.
+
+```{r}
+walmart_tsibble_train_agg %>%  features(Weekly_Sales, unitroot_kpss)
+```
+
+-   **kpss_stat**: Este valor representa la estadística de prueba calculada en la prueba KPSS. En tu caso, el valor es 0.07319524. La estadística de prueba se compara con los valores críticos para determinar si la serie es estacionaria en media. Si la estadística de prueba es menor que el valor crítico, se rechaza la hipótesis nula de no estacionariedad en media y se considera que la serie es estacionaria en media.
+
+-   **kpss_pvalue**: Este valor es el valor p asociado a la estadística de prueba KPSS. En tu caso, el valor es 0.1. El valor p se utiliza para evaluar la significancia estadística de la prueba. Si el valor p es menor que un umbral predefinido (generalmente 0.05), se rechaza la hipótesis nula y se considera que la serie es estacionaria en media.
+
+En nuestro caso la estadística de prueba es menor que el valor crítico y el valor p es mayor que 0.05. Esto sugiere que no hay suficiente evidencia para rechazar la hipótesis nula de no estacionariedad en media. Por lo tanto, basado en los resultados de la prueba KPSS, podríamos decir que la serie no es estacionaria en media.
+
+
+<u>**Estacionariedad en VARIANZA**</u>
+
+Para estudiar la estacionariedad en varianza hemos realizado una prueba de homocedasticidad o constancia de la varianza a lo largo del tiempo. Una forma común de hacerlo es mediante el análisis de la función de autocorrelación condicional (ACF) de los residuos del modelo ajustado.
+
+```{r}
+# Ajustar el modelo ARIMA
+arima_model <- auto.arima(walmart_tsibble_train_agg$Weekly_Sales)
+
+# Obtener los residuos del modelo ajustado
+residuals_arima_model <- residuals(arima_model)
+
+# Calcular la ACF de los residuos
+acf_res <- acf(residuals_arima_model, lag.max = 126, plot = FALSE)
+
+# Graficar la ACF de los residuos
+plot(acf_res, main = "ACF of Residuals", xlab = "Lag", ylab = "ACF")
+```
+
+En el gráfico de la función de autocorrelación condicional (ACF) de los residuos, se puede observar si existe alguna autocorrelación significativa en los rezagos (lags). Como los valores de la ACF están dentro de los intervalos de confianza y se aproximan a 0 a medida que aumenta el lag, indica que los residuos son ruido blanco y que la varianza es constante a lo largo del tiempo, lo que es indicativo de estacionariedad en varianza.
+
+El dato que sobresale claramente por encima del resto en el intervalo de confianza se debe precisamente al pico causado por Navidad y Acción de Gracias.
+
+En el caso de Walmart el estudio de características ACF y STL nos revela lo siguiente:
+
+```{r}
+walmart_tsibble_train_agg %>% features(Weekly_Sales, feat_acf)
+```
+
+-   **acf1**: Es el coeficiente de autocorrelación en el primer rezago (lag 1). Representa la correlación entre los valores actuales y los valores anteriores en un período de tiempo. En nuestro caso 0.339207.
+
+-   **acf10**: Es el coeficiente de autocorrelación en el décimo rezago (lag 10). Representa la correlación entre los valores actuales y los valores que ocurrieron hace 10 períodos de tiempo. En nuestro caso 0.3225304.
+
+-   **diff1_acf1**: Es el coeficiente de autocorrelación en el primer rezago después de aplicar una diferencia de primer orden a la serie temporal. Representa la correlación entre los valores actuales diferenciados y los valores anteriores diferenciados en un período de tiempo. En nuestro caso -0.4107651.
+
+-   **diff1_acf10**: Es el coeficiente de autocorrelación en el décimo rezago después de aplicar una diferencia de primer orden a la serie temporal. Representa la correlación entre los valores actuales diferenciados y los valores que ocurrieron hace 10 períodos de tiempo diferenciados. En nuestro caso -0.4921921.
+
+-   **diff2_acf1**: Es el coeficiente de autocorrelación en el primer rezago después de aplicar una diferencia de segundo orden a la serie temporal. Representa la correlación entre los valores actuales diferenciados dos veces y los valores anteriores diferenciados dos veces en un período de tiempo. En nuestro caso -0.6534423.
+
+-   **diff2_acf10**: Es el coeficiente de autocorrelación en el décimo rezago después de aplicar una diferencia de segundo orden a la serie temporal. Representa la correlación entre los valores actuales diferenciados dos veces y los valores que ocurrieron hace 10 períodos de tiempo diferenciados dos veces. En nuestro caso 0.9438333.
+
+```{r}
+walmart_tsibble_train_agg %>% features(Weekly_Sales, feat_stl)
+```
+
+-   **trend_strength**: Esta métrica representa la fuerza de la tendencia en los datos. Un valor más alto indica una tendencia más fuerte en los datos. En nuestro caso un valor de 0.3315853 sugiere que hay una tendencia discernible en los datos, pero no es demasiado pronunciada. Esto implica que la serie de ventas semanales de Walmart muestra cierta dirección o patrón a lo largo del tiempo, pero no está experimentando cambios extremadamente marcados o una tendencia muy fuerte.
+
+-   **spikiness**: Esta métrica representa la irregularidad o "picos" en los datos. Un valor más alto indica una mayor presencia de picos o variaciones abruptas en los datos. En nuestro caso el valor de 5.235051 indica que hay una alta variabilidad en la presencia de picos en tus datos. Esto implica que las ventas semanales de Walmart pueden experimentar fluctuaciones significativas en ciertos períodos, con la presencia de valores atípicos o picos altos en comparación con los valores promedio; como se puede apreciar en la gráfica y ya anteriormente comentado las semanas de Navidad y Acción de Gracias.
+
+-   **linearity**: Esta métrica representa la linealidad en los datos. Un valor más alto indica una mayor linealidad en los datos, lo que implica que los datos siguen una tendencia lineal. En nuestro caso 5746232.
+
+-   **curvature**: Esta métrica representa la curvatura en los datos. Se basa en el coeficiente de una regresión cuadrática ortogonal aplicada al componente de tendencia. Un valor más alto indica una mayor curvatura en los datos, lo que implica que los datos tienen una forma más curva o no lineal. En nuestro caso 1472471.
+
+Los valores de los indicadores de autocorrelación, como stl_e_acf1 y stl_e_acf10, pueden variar entre -1 y 1.
+
+- Un valor de 1 indica una autocorrelación positiva perfecta, lo que significa que los valores pasados y presentes están completamente correlacionados y se puede predecir uno a partir del otro de manera precisa.
+
+- Un valor de -1 indica una autocorrelación negativa perfecta, lo que significa que los valores pasados y presentes están completamente correlacionados, pero en dirección opuesta, y se puede predecir uno a partir del otro de manera precisa.
+
+- Un valor cercano a 0 indica una autocorrelación débil o nula, lo que implica que no hay una relación lineal o predictiva fuerte entre los valores pasados y presentes.
+
+En nuestro caso:
+
+-   **stl_e_acf1**: Esta métrica representa la autocorrelación a nivel de error después de aplicar la descomposición STL. Es es el primer coeficiente de autocorrelación de la serie residual. Un valor más alto indica una mayor correlación entre los errores residuales. En nuestro caso 0.05815408.
+
+-   **stl_e_acf10**: Esta métrica representa la autocorrelación a nivel de error hasta un retraso de 10 después de aplicar la descomposición STL. Es la suma de los cuadrados de los diez primeros coeficientes de autocorrelación de la serie residual. Un valor más alto indica una mayor correlación entre los errores residuales hasta un retraso de 10 períodos. En nuestro caso 0.2070959.
+
+Otras características:
+
+**Spectral_entropy**: la entropía espectral de una serie temporal es una medida de lo fácil que es predecir la serie. Una serie que tiene una fuerte tendencia y estacionalidad (y por lo tanto es fácil de predecir) tendrá una entropía cercana a 0. Una serie que es muy ruidosa (y por lo tanto es difícil de predecir) tendrá una entropía cercana a 1.
+
+También indica la cantidad de información o desorden presente en la señal de la serie temporal. Cuanto mayor sea el valor de la entropía espectral, mayor será la variabilidad y la impredecibilidad de la señal.
+
+```{r}
+# Calcula la transformada de Fourier de la serie temporal
+fourier_transform <- abs(fft(walmart_tsibble_train_agg$Weekly_Sales))
+
+# Calcula la densidad espectral de potencia
+power_spectral_density <- fourier_transform^2
+
+# Calcula la entropía espectral
+spectral_entropy <- entropy(power_spectral_density, base = 2)
+
+print(spectral_entropy)
+```
+
+En nuestro caso, un valor de 0.1367035 sugiere que la señal tiene cierta variabilidad pero no es extremadamente caótica y fácil de predecir.
+
+## Modelos DUMMY
+
+Algunos métodos de forecasting son extremadamente simples y sorprendentemente eficaces. Usaremos cuatro métodos de forecasting simples como puntos de referencia.
+
+```{r}
+# Fit the models
+walmart_tsibble_train_agg_fit <- walmart_tsibble_train_agg %>%
+  model(
+    Mean = MEAN(Weekly_Sales),
+    `Naïve` = NAIVE(Weekly_Sales),
+    `Seasonal naïve` = SNAIVE(Weekly_Sales),
+    Drift = RW(Weekly_Sales ~ drift())
+  )
+  
+# Generate forecasts for 16 weeks (5 weeks more than the training data)
+walmart_tsibble_train_agg_fit_fc <- walmart_tsibble_train_agg_fit %>% forecast(h = 10)
+
+# Plot series and forecasts
+walmart_tsibble_train_agg %>%
+  autoplot() +
+  autolayer(walmart_tsibble_train_agg_fit_fc, series = "Mean", alpha = 0.7) +
+  autolayer(walmart_tsibble_train_agg_fit_fc, series = "Naïve", alpha = 0.7) +
+  autolayer(walmart_tsibble_train_agg_fit_fc, series = "Seasonal naïve", alpha = 0.7) +
+  autolayer(walmart_tsibble_train_agg_fit_fc, series = "Drift", alpha = 0.7) +
+  ggtitle("Weekly Sales in Walmart") +
+  xlab("Week") + ylab("Weekly Sales") +
+  guides(colour = guide_legend(title = "Forecast")) + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6))
+```
+
+Otros como los intervalos de predicción mediante bootstrap pueden calcular intervalos de predicción calculando los percentiles para cada horizonte de predicción.
+
+```{r}
+## Fit the model
+fit <- walmart_tsibble_train_agg %>%
+  model(NAIVE(Weekly_Sales))
+## Generate simulations
+sim <- fit %>% generate(h = 30, times = 5, bootstrap = TRUE)
+
+walmart_tsibble_train_agg %>%
+  ggplot(aes(x = Date)) +
+  geom_line(aes(y = Weekly_Sales)) +
+  geom_line(aes(y = .sim, colour = as.factor(.rep)), data = sim) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6)) +
+  ggtitle("Bootstrap Forecasting") +
+  guides(col = FALSE)
+```
+
+## ARIMA 
+
+El modelo ARIMA (Autoregressive Integrated Moving Average) es uno de los modelos más utilizados para el análisis y la predicción de series temporales. Combina componentes autoregresivos (AR), componentes de promedio móvil (MA) y componentes de diferenciación (I) para capturar la estructura y los patrones presentes en los datos.
+
+El modelo ARIMA se define por tres parámetros principales: p, d y q.
+
+-   El parámetro **p** (orden del componente autoregresivo) indica el número de pasos de tiempo anteriores que se tienen en cuenta para predecir el valor actual. Un valor alto de p indica una dependencia fuerte de los valores pasados.
+
+-   El parámetro **d** (orden de diferenciación) representa el número de veces que se realiza la diferenciación para convertir una serie no estacionaria en una serie estacionaria. La diferenciación se utiliza para eliminar tendencias y estacionalidad en los datos.
+
+-   El parámetro **q** (orden del componente de promedio móvil) especifica el número de pasos de tiempo anteriores de los errores de predicción que se tienen en cuenta para predecir el valor actual. Un valor alto de q indica una dependencia fuerte de los errores pasados.
+
+En el proceso de ajuste de un modelo ARIMA implica la identificación de los valores óptimos de p, d y q, lo que se conoce como orden del modelo. Esto se puede lograr mediante técnicas como la función de autocorrelación (ACF) y la función de autocorrelación parcial (PACF), que ayudan a determinar la dependencia temporal en los datos.
+
+Es importante mencionar que el modelo ARIMA tiene algunas limitaciones y suposiciones, como la estacionariedad de la serie, la linealidad de las relaciones y la ausencia de valores atípicos.
+
+```{r}
+# Cálculo de la función de autocorrelación (ACF)
+acf_values <- acf(walmart_tsibble_train_agg$Weekly_Sales, lag.max = 126)
+
+# Cálculo de la función de autocorrelación parcial (PACF)
+pacf_values <- pacf(walmart_tsibble_train_agg$Weekly_Sales, lag.max = 126)
+
+# Gráfico de la función de autocorrelación (ACF)
+plot(acf_values, main = "ACF")
+
+# Gráfico de la función de autocorrelación parcial (PACF)
+plot(pacf_values, main = "PACF")
+```
+
+Una vez identificados posibles valores de p y q utilizando el análisis de ACF y PACF, realizamos la función auto.arima() para realizar una búsqueda automática y encontrar los mejores parámetros para el modelo.
+
+```{r}
+# Búsqueda automática de parámetros ARIMA
+arima_model <- auto.arima(walmart_tsibble_train_agg)
+
+# Imprimir los parámetros óptimos encontrados
+print(arima_model)
+```
+
+-   **ARIMA(2,0,2) with non-zero mean**: Indica los órdenes de los componentes AR, I y MA del modelo ARIMA. En nuestro caso, se trata de un modelo ARIMA con 2 términos autoregresivos (AR), 0 diferencias (I) y 2 términos de media móvil (MA).
+
+-   **Coefficients**: Muestra los coeficientes estimados para cada componente del modelo ARIMA. En nuestro caso, se presentan los coeficientes estimados para los términos AR1, AR2, MA1, MA2 y la media no nula (mean).
+
+-   **sigma^2**: Es la varianza estimada del error del modelo. 
+
+-   **log likelihood**: Es el logaritmo de la verosimilitud del modelo, una medida de qué tan bien se ajusta el modelo a los datos observados. 
+
+-   **AIC, AICc, BIC**: Sson criterios de información utilizados para la selección de modelos. Cuanto más pequeño sea el valor, mejor se considera el modelo en términos de ajuste y parsimonia. En nuestro caso, se presentan los valores del AIC (4256.31), AIC corregido (AICc, 4257.01) y BIC (4273.33).
+
